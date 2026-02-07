@@ -24,7 +24,7 @@ from ov_piano.logging import ColorLogger
 from ov_piano.data.maestro import MetaMAESTROv1, MetaMAESTROv2, MetaMAESTROv3
 from ov_piano.data.maestro import MelMaestro
 from ov_piano.models.ov import OnsetsAndVelocities
-from ov_piano.inference import strided_inference
+from ov_piano.inference import strided_inference, PedalDecoder
 from ov_piano.eval import GtLoaderMaestro
 
 
@@ -168,7 +168,7 @@ class ConfDef:
     INFERENCE_CHUNK_OVERLAP: float = 11
     INFERENCE_THRESHOLD: float = 0.74
     #
-    CONV1X1: List[int] = (200, 200)
+    CONV1X1: List[int] = (128, 128)
     LEAKY_RELU_SLOPE: float = 0.1
     #
     OUTPUT_DIR: Optional[str] = None  # "out/plots"
@@ -253,36 +253,48 @@ if __name__ == "__main__":
     if CONF.SNAPSHOT_INPATH is not None:
         load_model(
             model, CONF.SNAPSHOT_INPATH, eval_phase=True, to_cpu=True)
+    
+    # Create pedal decoder for single sustain pedal
+    pedal_decoder = PedalDecoder(num_pedals=1, threshold=0.5)
 
     ##############
     # INFERENCE
     ##############
     def model_inference(x):
         """
-        Convenience wrapper around the DNN to ensure output and input sequences
+        Convenience wrapper around DNN to ensure output and input sequences
         have same length.
         """
-        probs, vels = model(x)
+        probs, vels, pedals = model(x)  # Include pedal predictions
         probs = F.pad(torch.sigmoid(probs[-1]), (1, 0))
         vels = F.pad(torch.sigmoid(vels), (1, 0))
-        return probs, vels
+        # Ensure pedal shape is (b, 1, t) for decoder
+        pedals = pedals.squeeze()  # Remove extra dims
+        if len(pedals.shape) == 1:
+            pedals = pedals.unsqueeze(0).unsqueeze(0)  # (1, 1, t)
+        elif len(pedals.shape) == 2:
+            pedals = pedals.unsqueeze(1)  # (b, 1, t)
+        pedals = F.pad(torch.sigmoid(pedals), (1, 0))
+        return probs, vels, pedals
 
-    test_results = []
-    test_results_vel = []
-    len_test = len(maestro_test)
-    for i, (mel, roll, md) in enumerate(maestro_test, 1):
+test_results = []
+test_results_vel = []
+len_test = len(maestro_test)
+for i, (mel, roll, md) in enumerate(maestro_test, 1):
         txt_logger.info(f"[{i}/{len_test} (test set)] {md}")
         onsets = (roll[onsets_beg:onsets_end][key_beg:key_end] > 0)
         triple_onsets = make_triple_onsets(onsets)
         #
         with torch.no_grad():
             tmel = torch.from_numpy(mel).to(CONF.DEVICE).unsqueeze(0)
-            onset_pred, vel_pred = strided_inference(
+            onset_pred, vel_pred, pedal_pred = strided_inference(
                 model_inference, tmel, CHUNK_SIZE, CHUNK_OVERLAP)
+            # Process pedal predictions
+            pedal_events = pedal_decoder(pedal_pred)
             onset_pred = onset_pred.cpu().numpy().squeeze()
             vel_pred = vel_pred.cpu().numpy().squeeze()
 
-        def qplot_ranged(min_idx=None, max_idx=None):
+    def qplot_ranged(min_idx=None, max_idx=None):
             """
             Closure to inspect ranges flexibly via one-liners like::
               qplot_ranged(0, 1000)[0].show()

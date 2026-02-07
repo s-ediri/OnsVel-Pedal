@@ -19,7 +19,7 @@ from .models.building_blocks import Nms1d, GaussianBlur1d
 # ##############################################################################
 # # STRIDED INFERENCE
 # ##############################################################################
-def strided_inference(model, x, chunk_size=10000, chunk_overlap=100):
+def strided_inference(model, x, chunk_size=10000, chunk_overlap=0):
     """
     This function is designed to allow the inference of very large signals that
     don't fit on the resources at once, by processing strided, windowed chunks
@@ -50,10 +50,16 @@ def strided_inference(model, x, chunk_size=10000, chunk_overlap=100):
         chunk = x[..., beg:beg+chunk_size]
         outputs = model(chunk)
         outputs = [o.cpu().detach() for o in outputs]
-        assert all(chunk.shape[0] == o.shape[0] for o in outputs), \
+
+        # Handle variable number of model outputs (for compatibility)
+        assert len(outputs) >= 2, "Model must return at least 2 outputs (probs, vels)"
+
+        # Validate all outputs have correct batch size and time dimension
+        assert all(o.shape[0] == chunk.shape[0] for o in outputs), \
             "all b_outputs must equal b_in!"
-        assert all(chunk.shape[-1] == o.shape[-1] for o in outputs), \
+        assert all(o.shape[-1] == chunk.shape[-1] for o in outputs), \
             "all t_outputs must equal t_in!"
+
         results.append(outputs)
         result_lengths.append(chunk.shape[-1])
         del chunk
@@ -262,3 +268,103 @@ class OnsetVelocityNmsDecoder(torch.nn.Module):
             {"batch_idx": bbb.cpu(), "key": kkk.cpu(), "t_idx": ttt.cpu(),
              "prob": ppp.cpu(), "vel": vvv.cpu()})
         return df
+
+# ##############################################################################
+# # PEDAL DECODERS
+# ##############################################################################
+class PedalDecoder(torch.nn.Module):
+    """
+    Decoder for piano pedal events (sustain, soft, tenuto).
+    
+    Given a tensor of raw logits for pedal predictions, this decoder:
+    1. Converts logits to probabilities (sigmoid)
+    2. Detects pedal state transitions (on/off events)
+    3. Returns pedal events as onset/offset pairs
+    
+    Each pedal is treated independently as a binary state machine.
+    """
+
+    def __init__(self, num_pedals=3, threshold=0.5):
+        """
+        :param num_pedals: Number of pedal types (default: 3 for sustain, soft, tenuto)
+        :param threshold: Probability threshold for pedal activation
+        """
+        super().__init__()
+        self.num_pedals = num_pedals
+        self.threshold = threshold
+
+    @staticmethod
+    def logits_to_probs(logits):
+        """Convert raw logits to probabilities using sigmoid."""
+        return torch.sigmoid(logits)
+
+    @staticmethod
+    def detect_transitions(probs, threshold=0.5):
+        """
+        Detect state transitions in pedal activation.
+        Returns onset and offset indices for each pedal.
+        
+        :param probs: Tensor of shape (b, num_pedals, t) with values in [0, 1]
+        :param threshold: Probability threshold for considering pedal "on"
+        :returns: Dictionary with "onsets" and "offsets" tensors
+        """
+        # Binarize: 1 if prob >= threshold, 0 otherwise
+        states = (probs >= threshold).float()
+        
+        # Detect transitions by comparing consecutive time steps
+        # Pad at beginning to detect onset at t=0
+        padded_states = F.pad(states, (1, 0), mode='constant', value=0.0)
+        
+        # Transition = difference between consecutive states
+        transitions = padded_states[..., 1:] - padded_states[..., :-1]
+        
+        # Onsets: transitions from 0 to 1 (positive transitions)
+        onsets = transitions > 0
+        # Offsets: transitions from 1 to 0 (negative transitions)
+        offsets = transitions < 0
+        
+        return {"onsets": onsets, "offsets": offsets, "states": states}
+
+    def forward(self, pedal_logits):
+        """
+        :param pedal_logits: Tensor of shape (b, num_pedals, t) with raw logits
+        :returns: Dictionary with pedal events for each batch and pedal type
+        """
+        b, p, t = pedal_logits.shape
+        assert p == self.num_pedals, \
+            f"Expected {self.num_pedals} pedals, got {p}"
+        
+        with torch.no_grad():
+            # Convert logits to probabilities
+            probs = self.logits_to_probs(pedal_logits)
+            
+            # Detect transitions
+            transitions = self.detect_transitions(probs, self.threshold)
+        
+        # Extract events as dataframes per batch/pedal
+        batch_indices, pedal_indices, time_indices = transitions["onsets"].nonzero(as_tuple=True)
+        
+        # Create dataframe for onset events
+        onset_df = pd.DataFrame({
+            "batch_idx": batch_indices.cpu(),
+            "pedal_idx": pedal_indices.cpu(),  # 0=sustain, 1=soft, 2=tenuto
+            "t_idx": time_indices.cpu(),
+            "event_type": "onset"
+        })
+        
+        # Extract offset events
+        batch_indices, pedal_indices, time_indices = transitions["offsets"].nonzero(as_tuple=True)
+        
+        offset_df = pd.DataFrame({
+            "batch_idx": batch_indices.cpu(),
+            "pedal_idx": pedal_indices.cpu(),
+            "t_idx": time_indices.cpu(),
+            "event_type": "offset"
+        })
+        
+        # Combine and sort by time
+        events_df = pd.concat([onset_df, offset_df], ignore_index=True)
+        events_df = events_df.sort_values(["batch_idx", "t_idx"]).reset_index(drop=True)
+        
+        # Also return probability maps for threshold analysis
+        return events_df, probs, transitions["states"]

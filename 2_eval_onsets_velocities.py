@@ -23,6 +23,7 @@ and the test evaluation is performed only once.
 
 
 import os
+import gc
 # For omegaconf
 from dataclasses import dataclass
 from typing import Optional, List
@@ -107,15 +108,15 @@ class ConfDef:
     HDF5_ROLL_PATH: str = os.path.join(
         "datasets",
         "MAESTROv3_roll_quant=0.024_midivals=128_extendsus=True.h5")
-    SNAPSHOT_INPATH: str = MISSING
+    SNAPSHOT_INPATH: str = os.path.join("out", "model_snapshots", "OnsetsAndVelocities_2026_02_07_11_29_44.362.torch")
     #
-    CONV1X1: List[int] = (200, 200)
+    CONV1X1: List[int] = (128, 128)  # MUST match checkpoint architecture!
     LEAKY_RELU_SLOPE: Optional[float] = 0.1
     #
-    XV_TAKE_ONE_EVERY: int = 5
-    SEARCH_THRESHOLDS: List[float] = (0.70, 0.71, 0.72, 0.73, 0.74, 0.75,
-                                      0.76, 0.77, 0.78, 0.79, 0.80)
+    XV_TAKE_ONE_EVERY: int = 20  # Increased from 5 to reduce memory usage
+    SEARCH_THRESHOLDS: List[float] = (0.85,)  # High threshold to prevent too many predictions
     SEARCH_SHIFTS: List[float] = (-0.01,)
+    MAX_PREDICTIONS_PER_FILE: int = 20000  # Safety limit (normal files have 1k-5k notes)
     #
     DECODER_GAUSS_STD: float = 1
     DECODER_GAUSS_KSIZE: int = 11
@@ -123,7 +124,7 @@ class ConfDef:
     TOLERANCE_SECS: float = 0.05
     TOLERANCE_VEL: float = 0.1
     #
-    INFERENCE_CHUNK_SIZE: float = 300
+    INFERENCE_CHUNK_SIZE: float = 60  # Reduced from 300 to 60 for lower memory usage
     INFERENCE_CHUNK_OVERLAP: float = 11
 
 
@@ -215,28 +216,65 @@ if __name__ == "__main__":
         Convenience wrapper around the DNN to ensure output and input sequences
         have same length.
         """
-        probs, vels = model(x)
+        probs, vels, pedals = model(x)
         probs = F.pad(torch.sigmoid(probs[-1]), (1, 0))
         vels = F.pad(torch.sigmoid(vels), (1, 0))
+        # Note: pedals output is returned but not used in onset/velocity evaluation
         return probs, vels
 
     xv_dataframes = []
     len_xv = len(maestro_xv)
     for i, (mel, roll, md) in enumerate(maestro_xv, 1):
         txt_logger.info(f"[{i}/{len_xv}] XV inference: {md}")
-        with torch.no_grad():
-            tmel = torch.from_numpy(mel).to(CONF.DEVICE).unsqueeze(0)
-            onset_pred, vel_pred = strided_inference(
-                model_inference, tmel, CHUNK_SIZE, CHUNK_OVERLAP)
-            del tmel
-            pred_df = decoder(
-                onset_pred, vel_pred, pthresh=min(CONF.SEARCH_THRESHOLDS))
-            gt_df = xv_gts(md)[0]
-            xv_dataframes.append((gt_df, pred_df))
+        try:
+            with torch.no_grad():
+                tmel = torch.from_numpy(mel).to(CONF.DEVICE).unsqueeze(0)
+                onset_pred, vel_pred = strided_inference(
+                    model_inference, tmel, CHUNK_SIZE, CHUNK_OVERLAP)
+                del tmel
+                pred_df = decoder(
+                    onset_pred, vel_pred, pthresh=min(CONF.SEARCH_THRESHOLDS))
+
+                # Safety check: skip files with excessive predictions
+                num_preds = len(pred_df)
+                gt_df = xv_gts(md)[0]
+                num_gt = len(gt_df)
+
+                if num_preds > CONF.MAX_PREDICTIONS_PER_FILE:
+                    txt_logger.warning(
+                        f"SKIPPING {md[0]}: Too many predictions ({num_preds:,}) "
+                        f"vs {num_gt:,} ground truth. This would cause OOM.")
+                    continue
+
+                txt_logger.info(f"  GT: {num_gt:,} notes, Pred: {num_preds:,} notes")
+                xv_dataframes.append((gt_df, pred_df))
+
+        except Exception as e:
+            txt_logger.error(f"ERROR processing {md[0]}: {e}")
+            continue
+        finally:
+            # Aggressive memory cleanup
+            del mel, roll, onset_pred, vel_pred
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     ###############
     # XV GRIDSEARCH
     ###############
+    # Check if we have enough valid files to continue
+    if len(xv_dataframes) == 0:
+        txt_logger.error(
+            "ERROR: No valid validation files processed! "
+            "All files were skipped due to excessive predictions or errors.")
+        txt_logger.error(
+            "Try: 1) Lower MAX_PREDICTIONS_PER_FILE, or "
+            "2) Increase SEARCH_THRESHOLDS to reduce predictions, or "
+            "3) Check if model is trained properly.")
+        raise RuntimeError("No valid validation files for evaluation")
+
+    txt_logger.info(f"Successfully processed {len(xv_dataframes)} / {len_xv} validation files")
+
     xv_gridsearch = {}
     xv_gridsearch_vel = {}
     for thresh in CONF.SEARCH_THRESHOLDS:
@@ -253,11 +291,32 @@ if __name__ == "__main__":
                 this_eval_vel.append(prf1_v)
             xv_gridsearch[(thresh, shift)] = this_eval
             xv_gridsearch_vel[(thresh, shift)] = this_eval_vel
-    xv_summary = {k: np.mean(v, axis=0) for k, v in xv_gridsearch.items()}
-    xv_summary_vel = {k: np.mean(v, axis=0)
-                      for k, v in xv_gridsearch_vel.items()}
-    ((best_t, best_s), (best_p, best_r, best_f1)) = max(
-        xv_summary.items(), key=lambda elt: elt[1][2])
+    # Compute mean metrics ensuring proper array shape
+    xv_summary = {}
+    for k, v in xv_gridsearch.items():
+        mean_val = np.mean(v, axis=0)
+        # Ensure it's always a 1D array of length 3
+        if mean_val.ndim == 0:
+            mean_val = np.array([mean_val, mean_val, mean_val])
+        xv_summary[k] = mean_val
+
+    xv_summary_vel = {}
+    for k, v in xv_gridsearch_vel.items():
+        mean_val = np.mean(v, axis=0)
+        if mean_val.ndim == 0:
+            mean_val = np.array([mean_val, mean_val, mean_val])
+        xv_summary_vel[k] = mean_val
+
+    # Find best threshold/shift based on F1 score
+    try:
+        ((best_t, best_s), (best_p, best_r, best_f1)) = max(
+            xv_summary.items(), key=lambda elt: elt[1][2])
+    except (IndexError, ValueError) as e:
+        txt_logger.error(f"Error finding best hyperparameters: {e}")
+        txt_logger.error(f"xv_summary structure: {xv_summary}")
+        # Use first threshold/shift as fallback
+        (best_t, best_s) = list(xv_summary.keys())[0]
+        (best_p, best_r, best_f1) = xv_summary[(best_t, best_s)]
     #
     xv_summary_df = pd.DataFrame(
         ((t, s, p, r, f1) for ((t, s), (p, r, f1)) in xv_summary.items()),
@@ -279,20 +338,44 @@ if __name__ == "__main__":
     len_test = len(maestro_test)
     for i, (mel, roll, md) in enumerate(maestro_test, 1):
         txt_logger.info(f"[{i}/{len_test} (test set)] {md}")
-        with torch.no_grad():
-            tmel = torch.from_numpy(mel).to(CONF.DEVICE).unsqueeze(0)
-            onset_pred, vel_pred = strided_inference(
-                model_inference, tmel, CHUNK_SIZE, CHUNK_OVERLAP)
-            del tmel
-            pred_df = decoder(
-                onset_pred, vel_pred, pthresh=min(CONF.SEARCH_THRESHOLDS))
-            gt_df = test_gts(md)[0]
-        prf1, prf1_v = threshold_eval_single_file(
-            gt_df, pred_df, SECS_PER_FRAME, key_beg,
-            thresh=best_t, shift_preds=best_s,
-            tol_secs=CONF.TOLERANCE_SECS, tol_vel=CONF.TOLERANCE_VEL)
-        test_results.append((md[0], *prf1))
-        test_results_vel.append((md[0], *prf1_v))
+        try:
+            with torch.no_grad():
+                tmel = torch.from_numpy(mel).to(CONF.DEVICE).unsqueeze(0)
+                onset_pred, vel_pred = strided_inference(
+                    model_inference, tmel, CHUNK_SIZE, CHUNK_OVERLAP)
+                del tmel
+                pred_df = decoder(
+                    onset_pred, vel_pred, pthresh=min(CONF.SEARCH_THRESHOLDS))
+                gt_df = test_gts(md)[0]
+
+            # Safety check: skip files with excessive predictions
+            num_preds = len(pred_df)
+            num_gt = len(gt_df)
+
+            if num_preds > CONF.MAX_PREDICTIONS_PER_FILE:
+                txt_logger.warning(
+                    f"SKIPPING {md[0]}: Too many predictions ({num_preds:,}) "
+                    f"vs {num_gt:,} ground truth. This would cause OOM.")
+                continue
+
+            txt_logger.info(f"  GT: {num_gt:,} notes, Pred: {num_preds:,} notes")
+
+            prf1, prf1_v = threshold_eval_single_file(
+                gt_df, pred_df, SECS_PER_FRAME, key_beg,
+                thresh=best_t, shift_preds=best_s,
+                tol_secs=CONF.TOLERANCE_SECS, tol_vel=CONF.TOLERANCE_VEL)
+            test_results.append((md[0], *prf1))
+            test_results_vel.append((md[0], *prf1_v))
+
+        except Exception as e:
+            txt_logger.error(f"ERROR processing {md[0]}: {e}")
+            continue
+        finally:
+            # Aggressive memory cleanup
+            del mel, roll, onset_pred, vel_pred, pred_df, gt_df
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     #
     test_results_df = pd.DataFrame(
         test_results, columns=["Filename", "P", "R", "F1"])

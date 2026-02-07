@@ -146,7 +146,7 @@ if __name__ == "__main__":
             with torch.no_grad():
                 wave = torch_load_resample_audio(
                     abspath + ".wav", CONF.TARGET_SR, mono=True,
-                    normalize_wav=True, device=CONF.DEVICE)
+                     device=CONF.DEVICE)
                 logmel = logmel_fn(wave).to("cpu").numpy()
             h5mel.append(logmel, metadata)
 

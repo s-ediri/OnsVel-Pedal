@@ -79,9 +79,9 @@ class GtLoaderMaps:
         self.dataset, self.meta_dataset = dataset, meta_dataset
         self.midi_abspaths = [self.get_metadata_path(md, meta_dataset)
                               for _, _, md in dataset]
-        with ProcessPoolExecutor() as executor:
-            midi_eventdata = executor.map(
-                self.get_midi_eventdata, self.midi_abspaths)
+        # Disable ProcessPoolExecutor to avoid memory issues on Windows
+        # Use sequential processing instead
+        midi_eventdata = [self.get_midi_eventdata(ap) for ap in self.midi_abspaths]
         self.midi_eventdata = {ap: data for ap, data
                                in zip(self.midi_abspaths, midi_eventdata)}
         # all onset-offset intervals must be >0, so add epsilon if needed:
@@ -229,3 +229,132 @@ def threshold_eval_single_file(
         velocity_tolerance=tol_vel)
     #
     return (prec, rec, f1), (prec_v, rec_v, f1_v)
+
+# ##############################################################################
+# # PEDAL EVALUATION
+# ##############################################################################
+def eval_pedal_events(gt_onsets, gt_pedals, pred_onsets, pred_pedals, 
+                      tol_secs=0.05):
+    """
+    Evaluate pedal event detection accuracy.
+    
+    Similar to eval_note_events but for binary pedal state detection.
+    Compares ground truth vs predicted pedal onset/offset times.
+    
+    :param gt_onsets: Ground truth pedal event times (seconds)
+    :param gt_pedals: Ground truth pedal states (0=off, 1=on)
+    :param pred_onsets: Predicted pedal event times (seconds)
+    :param pred_pedals: Predicted pedal states (0=off, 1=on)
+    :param tol_secs: Time tolerance in seconds (default 50ms)
+    :returns: Tuple (precision, recall, f1_score)
+    """
+    # If no events, return perfect score for empty predictions, 0 otherwise
+    if len(gt_onsets) == 0:
+        if len(pred_onsets) == 0:
+            return 1.0, 1.0, 1.0
+        else:
+            return 0.0, 1.0, 0.0
+    
+    if len(pred_onsets) == 0:
+        return 0.0, 0.0, 0.0
+    
+    # Match predictions to ground truth within tolerance window
+    tp = 0  # True positives
+    fp = 0  # False positives
+    fn = 0  # False negatives
+    
+    matched_gt = set()
+    
+    for pred_t, pred_state in zip(pred_onsets, pred_pedals):
+        # Find closest GT event within tolerance
+        best_match = None
+        best_dist = tol_secs
+        
+        for gt_idx, (gt_t, gt_state) in enumerate(zip(gt_onsets, gt_pedals)):
+            if gt_idx in matched_gt:
+                continue
+            
+            dist = abs(pred_t - gt_t)
+            if dist < best_dist and pred_state == gt_state:
+                best_match = gt_idx
+                best_dist = dist
+        
+        if best_match is not None:
+            tp += 1
+            matched_gt.add(best_match)
+        else:
+            fp += 1
+    
+    # Remaining unmatched GTs are false negatives
+    fn = len(gt_onsets) - len(matched_gt)
+    
+    # Compute metrics
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * (precision * recall) / (precision + recall) \
+        if (precision + recall) > 0 else 0.0
+    
+    return precision, recall, f1
+
+
+def threshold_eval_pedals(gt_pedal_events, pred_pedal_probs, secs_per_frame,
+                          thresh=0.5, shift_preds=0, tol_secs=0.05):
+    """
+    Evaluate pedal event detection with thresholding.
+    
+    :param gt_pedal_events: Ground truth pedal events dataframe with columns
+      [onset, pedal_idx, event_type]
+    :param pred_pedal_probs: Predicted pedal probabilities (b, num_pedals, t)
+    :param secs_per_frame: Conversion factor from frame index to seconds
+    :param thresh: Probability threshold for pedal activation
+    :param shift_preds: Time shift to apply to predictions (seconds)
+    :param tol_secs: Time tolerance for matching
+    :returns: Dictionary with per-pedal precision, recall, f1 scores
+    """
+    from .inference import PedalDecoder
+    
+    # Decode pedal events from probabilities
+    decoder = PedalDecoder(num_pedals=3, threshold=thresh)
+    events_df, probs, states = decoder(pred_pedal_probs)
+    
+    # Convert frame indices to seconds
+    events_df = events_df.copy()
+    events_df["onset"] = (events_df["t_idx"].to_numpy() * 
+                          float(secs_per_frame)) + shift_preds
+    
+    # Evaluate each pedal separately
+    pedal_names = ["sustain", "soft", "tenuto"]
+    results = {}
+    
+    for pedal_idx, pedal_name in enumerate(pedal_names):
+        # Filter GT and predicted events for this pedal
+        gt_subset = gt_pedal_events[gt_pedal_events["pedal_idx"] == pedal_idx]
+        pred_subset = events_df[events_df["pedal_idx"] == pedal_idx]
+        
+        # Extract times and event types
+        gt_onsets = gt_subset["onset"].to_numpy() if len(gt_subset) > 0 else np.array([])
+        gt_types = gt_subset["event_type"].to_numpy() if len(gt_subset) > 0 else np.array([])
+        
+        pred_onsets = pred_subset["onset"].to_numpy() if len(pred_subset) > 0 else np.array([])
+        pred_types = pred_subset["event_type"].to_numpy() if len(pred_subset) > 0 else np.array([])
+        
+        # Map event types to binary states (onset=1, offset=0)
+        gt_states = (gt_types == "onset").astype(float)
+        pred_states = (pred_types == "onset").astype(float)
+        
+        # Evaluate
+        prec, rec, f1 = eval_pedal_events(
+            gt_onsets, gt_states,
+            pred_onsets, pred_states,
+            tol_secs=tol_secs
+        )
+        
+        results[pedal_name] = {"precision": prec, "recall": rec, "f1": f1}
+    
+    # Also compute macro-average across pedals
+    avg_prec = np.mean([v["precision"] for v in results.values()])
+    avg_rec = np.mean([v["recall"] for v in results.values()])
+    avg_f1 = np.mean([v["f1"] for v in results.values()])
+    results["macro_avg"] = {"precision": avg_prec, "recall": avg_rec, "f1": avg_f1}
+    
+    return results

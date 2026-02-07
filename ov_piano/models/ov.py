@@ -155,6 +155,15 @@ class OnsetsAndVelocities(torch.nn.Module):
                     self.VSTAGE_CAM_DILATIONS, self.VSTAGE_CAM_PADDINGS,
                     bn_momentum, leaky_relu_slope, dropout_drop_p),
             SubSpectralNorm(1, out_height, out_height, bn_momentum))
+        
+        # Add pedal detection stage (sustain pedal only)
+        self.pedal_stage = torch.nn.Sequential(
+            self.get_cam_stage(
+                    vel_in_chans, 1, conv1x1head,
+                    self.VSTAGE_NUM_CAMS, self.VSTAGE_CAM_HDC_CHANS,
+                    self.VSTAGE_CAM_SE_BOTTLENECK, self.VSTAGE_CAM_KSIZES,
+                    self.VSTAGE_CAM_DILATIONS, self.VSTAGE_CAM_PADDINGS,
+                    bn_momentum, leaky_relu_slope, dropout_drop_p))
 
         # initialize parameters
         if init_fn is not None:
@@ -203,10 +212,10 @@ class OnsetsAndVelocities(torch.nn.Module):
     def forward(self, x, trainable_onsets=True):
         """
         :param x: Logmel batch of shape ``(b, melbins, t)``
-        :returns: ``(x_stages, velocities)``. See ``forward_onsets`` for
+        :returns: ``(x_stages, velocities, pedals)``. See ``forward_onsets`` for
           a description of ``x_stages``. The ``velocities`` tensor has shape
-          ``(b, 1, keys, t-1)``, and is the result of processing ``stem_out``
-          concatenated with the last ``x_stage`` output.
+          ``(b, keys, t-1)``, and ``pedals`` tensor has shape ``(b, 1, t-1)``
+          for the sustain pedal (averaged across keys).
         """
         if trainable_onsets:
             x_stages, stem_out = self.forward_onsets(x)
@@ -217,6 +226,9 @@ class OnsetsAndVelocities(torch.nn.Module):
                 stem_out = torch.cat([stem_out, x_stages[-1].unsqueeze(1)],
                                      dim=1)
         #
-        velocities = self.velocity_stage(stem_out).squeeze(1)
+        velocities = self.velocity_stage(stem_out).squeeze(1)  # (b, out_height, t)
+        pedals_per_key = self.pedal_stage(stem_out).squeeze(1)  # (b, out_height, t) - per-key pedal predictions
+        # Average across keys to get single pedal signal: (b, out_height, t) -> (b, 1, t)
+        pedals = pedals_per_key.mean(dim=1, keepdim=True)
         #
-        return x_stages, velocities
+        return x_stages, velocities, pedals

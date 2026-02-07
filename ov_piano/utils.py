@@ -138,7 +138,7 @@ class IncrementalHDF5:
 # # AUDIO PREPROCESSING
 # ##############################################################################
 def torch_load_resample_audio(path, target_sr=16000, mono=True,
-                              normalize_wav=True, device="cpu"):
+                              device="cpu"):
     """
     Analogously to ``librosa.load``, this function loads and resamples a wav
     file. The resampling operation from torchaudio is much faster.
@@ -147,7 +147,7 @@ def torch_load_resample_audio(path, target_sr=16000, mono=True,
     :param mono: If true, returned wavfile will be averaged down to mono.
     :param device: Returned wavfile will be on the specified device.
     """
-    wave, sr_in = torchaudio.load(path, normalize=normalize_wav)
+    wave, sr_in = torchaudio.load(path)
     resampler = torchaudio.transforms.Resample(sr_in, target_sr).to(device)
     if mono:
         wave = wave.mean(dim=0)
@@ -250,6 +250,47 @@ def set_seed(seed=0):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+
+def save_resume_state(epoch, batch_idx, global_step, checkpoint_dir):
+    """
+    Save training resume state (epoch, batch index, global step) to JSON file.
+    
+    This enables resumption from exact position within an epoch.
+    
+    :param epoch: Current epoch number (1-indexed)
+    :param batch_idx: Current batch index within epoch (0-indexed)
+    :param global_step: Global training step counter
+    :param checkpoint_dir: Directory where resume state file will be saved
+    """
+    resume_state = {
+        "epoch": epoch,
+        "batch_idx": batch_idx,
+        "global_step": global_step
+    }
+    state_path = os.path.join(checkpoint_dir, ".resume_state.json")
+    with open(state_path, "w") as f:
+        json.dump(resume_state, f)
+    return state_path
+
+
+def load_resume_state(checkpoint_dir):
+    """
+    Load training resume state from JSON file.
+    
+    Returns resume state if exists, otherwise returns None.
+    
+    :param checkpoint_dir: Directory to search for resume state file
+    :return: dict with keys 'epoch', 'batch_idx', 'global_step' or None
+    """
+    state_path = os.path.join(checkpoint_dir, ".resume_state.json")
+    if os.path.isfile(state_path):
+        try:
+            with open(state_path, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return None
+    return None
 
 
 def breakpoint_json(path="breakpoint.json", step=None):
