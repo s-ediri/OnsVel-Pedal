@@ -616,13 +616,14 @@ if __name__ == "__main__":
             # We emphasize transition regions so the model learns onset/offset timing more reliably.
             pedal_logits = pedals.reshape(-1)
             pedal_targets = sustain_norm.reshape(-1)
-            pedal_weights = torch.ones_like(pedal_targets)
+            pedal_weights = torch.ones_like(pedal_targets, dtype=torch.float32)
+            pedal_frame_targets = sustain_norm.squeeze(1)
             pedal_transition_mask = torch.abs(
-                sustain_norm[..., 1:] - sustain_norm[..., :-1]).squeeze(1)
+                pedal_frame_targets[:, 1:] - pedal_frame_targets[:, :-1])
             if pedal_transition_mask.numel() > 0:
-                pedal_transition_weights = torch.ones_like(pedal_transition_mask)
-                pedal_transition_weights += pedal_transition_mask
-                pedal_weights[1:] += pedal_transition_weights.reshape(-1)
+                pedal_transition_weights = torch.ones_like(pedal_frame_targets)
+                pedal_transition_weights[:, 1:] += pedal_transition_mask
+                pedal_weights = pedal_transition_weights.reshape(-1)
             pedal_loss = CONF.PEDAL_LOSS_LAMBDA * torch.nn.functional.binary_cross_entropy_with_logits(
                 pedal_logits, pedal_targets, pos_weight=pedal_pos_weight, reduction='none')
             pedal_loss = (pedal_loss * pedal_weights).mean()

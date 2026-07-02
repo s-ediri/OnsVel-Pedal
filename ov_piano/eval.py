@@ -412,6 +412,17 @@ def eval_pedal_events(gt_onsets, gt_pedals, pred_onsets, pred_pedals,
     return precision, recall, f1
 
 
+def _score_event_type(gt_events_df, pred_events_df, tol_secs):
+    if len(gt_events_df) == 0 and len(pred_events_df) == 0:
+        return 1.0, 1.0, 1.0
+    if len(gt_events_df) == 0:
+        return 0.0, 1.0, 0.0
+    if len(pred_events_df) == 0:
+        return 0.0, 0.0, 0.0
+    return eval_sus_pedal_simple(gt_events_df, pred_events_df,
+                                  tol_secs=tol_secs)
+
+
 def threshold_eval_pedals(gt_pedal_events, pred_pedal_probs, secs_per_frame,
                           thresh=0.5, shift_preds=0, tol_secs=0.05):
     """
@@ -494,28 +505,17 @@ def threshold_eval_pedals(gt_pedal_events, pred_pedal_probs, secs_per_frame,
         gt_events_df = pd.DataFrame({'onset': gt_onsets, 'event_type': gt_types})
         pred_events_df = pd.DataFrame({'onset': pred_onsets, 'event_type': pred_types})
 
-        def _score_for_event_type(event_type):
-            gt_filtered = gt_events_df[gt_events_df['event_type'] == event_type]
-            pred_filtered = pred_events_df[pred_events_df['event_type'] == event_type]
-            if len(gt_filtered) == 0 and len(pred_filtered) == 0:
-                return 1.0, 1.0, 1.0
-            if len(gt_filtered) == 0:
-                return 0.0, 1.0, 0.0
-            if len(pred_filtered) == 0:
-                return 0.0, 0.0, 0.0
-            return eval_sus_pedal_simple(gt_filtered, pred_filtered, tol_secs=tol_secs)
+        onset_prec, onset_rec, onset_f1 = _score_event_type(
+            gt_events_df[gt_events_df['event_type'] == 'onset'],
+            pred_events_df[pred_events_df['event_type'] == 'onset'],
+            tol_secs)
+        offset_prec, offset_rec, offset_f1 = _score_event_type(
+            gt_events_df[gt_events_df['event_type'] == 'offset'],
+            pred_events_df[pred_events_df['event_type'] == 'offset'],
+            tol_secs)
 
-        onset_prec, onset_rec, onset_f1 = _score_for_event_type('onset')
-        offset_prec, offset_rec, offset_f1 = _score_for_event_type('offset')
-
-        if len(gt_events_df) == 0 and len(pred_events_df) == 0:
-            prec, rec, f1 = 1.0, 1.0, 1.0
-        elif len(gt_events_df) == 0:
-            prec, rec, f1 = 0.0, 1.0, 0.0
-        elif len(pred_events_df) == 0:
-            prec, rec, f1 = 0.0, 0.0, 0.0
-        else:
-            prec, rec, f1 = eval_sus_pedal_simple(gt_events_df, pred_events_df, tol_secs=tol_secs)
+        prec, rec, f1 = _score_event_type(gt_events_df, pred_events_df,
+                                          tol_secs)
 
         results[pedal_name] = {
             "precision": prec,

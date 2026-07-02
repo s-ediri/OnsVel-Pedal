@@ -298,16 +298,11 @@ class OnsetVelocityNmsDecoder(torch.nn.Module):
 # # PEDAL DECODERS
 # ##############################################################################
 class PedalDecoder(torch.nn.Module):
-    """
-    Decoder for piano pedal events (sustain, soft, tenuto).
+    """Decode pedal predictions into onset/offset events.
 
-    Given a tensor of raw logits for pedal predictions, this decoder:
-    1. Converts logits to probabilities (sigmoid)
-    2. Smooths the sequence slightly to reduce jitter
-    3. Detects pedal state transitions using hysteresis and minimum hold time
-    4. Returns pedal events as onset/offset pairs
-
-    Each pedal is treated independently as a binary state machine.
+    The decoder converts raw logits to probabilities, applies a light temporal
+    smoothing pass, and then uses hysteresis plus a minimum hold-time rule to
+    suppress chatter around threshold crossings.
     """
 
     def __init__(self, num_pedals=3, threshold=0.5, hysteresis=0.1,
@@ -340,8 +335,8 @@ class PedalDecoder(torch.nn.Module):
         """Apply a small moving-average smoothing over time."""
         if self.smoothing_window <= 1 or probs.shape[-1] <= 1:
             return probs
-        b, p, t = probs.shape
-        flat = probs.reshape(-1, 1, t)
+        batch_size, num_pedals, num_steps = probs.shape
+        flat = probs.reshape(-1, 1, num_steps)
         kernel = torch.ones(1, 1, self.smoothing_window,
                             device=probs.device, dtype=probs.dtype)
         kernel /= self.smoothing_window
@@ -349,7 +344,7 @@ class PedalDecoder(torch.nn.Module):
                               self.smoothing_window // 2),
                        mode="replicate")
         smoothed = F.conv1d(padded, kernel)
-        return smoothed.reshape(b, p, t)
+        return smoothed.reshape(batch_size, num_pedals, num_steps)
 
     def detect_transitions(self, probs):
         """
@@ -361,22 +356,26 @@ class PedalDecoder(torch.nn.Module):
         """
         smoothed_probs = self._smooth_probs(probs)
         probs = 0.7 * probs + 0.3 * smoothed_probs
-        b, p, t = probs.shape
-        states = torch.zeros((b, p, t), device=probs.device, dtype=torch.float32)
-        onsets = torch.zeros((b, p, t), device=probs.device, dtype=torch.bool)
-        offsets = torch.zeros((b, p, t), device=probs.device, dtype=torch.bool)
+        batch_size, num_pedals, num_steps = probs.shape
+        states = torch.zeros((batch_size, num_pedals, num_steps),
+                             device=probs.device, dtype=torch.float32)
+        onsets = torch.zeros((batch_size, num_pedals, num_steps),
+                             device=probs.device, dtype=torch.bool)
+        offsets = torch.zeros((batch_size, num_pedals, num_steps),
+                              device=probs.device, dtype=torch.bool)
 
-        prev_states = torch.zeros((b, p), device=probs.device, dtype=torch.float32)
-        last_change = torch.full((b, p), -self.min_hold_steps,
+        prev_states = torch.zeros((batch_size, num_pedals),
+                                  device=probs.device, dtype=torch.float32)
+        last_change = torch.full((batch_size, num_pedals), -self.min_hold_steps,
                                  device=probs.device, dtype=torch.long)
         upper = self.threshold + self.hysteresis
         lower = self.threshold - self.hysteresis
 
-        for step in range(t):
+        for step in range(num_steps):
             current_probs = probs[..., step]
             next_states = prev_states.clone()
-            for batch_idx in range(b):
-                for pedal_idx in range(p):
+            for batch_idx in range(batch_size):
+                for pedal_idx in range(num_pedals):
                     prob = float(current_probs[batch_idx, pedal_idx])
                     prev_state = int(prev_states[batch_idx, pedal_idx])
                     time_since_change = step - int(last_change[batch_idx, pedal_idx])
