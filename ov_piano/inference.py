@@ -40,6 +40,7 @@ def strided_inference(model, x, chunk_size=10000, chunk_overlap=0):
     #
     in_b, in_h, in_w = x.shape
     stride = chunk_size - chunk_overlap
+    assert stride > 0, "chunk_overlap must be smaller than chunk_size!"
     if in_w <= chunk_size:
         stride = chunk_size  # in this case only 1 chunk needed
     # compute strided inference
@@ -49,7 +50,31 @@ def strided_inference(model, x, chunk_size=10000, chunk_overlap=0):
     for beg in range(0, in_w, stride):
         chunk = x[..., beg:beg+chunk_size]
         outputs = model(chunk)
-        outputs = [o.cpu().detach() for o in outputs]
+        # Guard against invalid or unexpected model returns
+        if outputs is None:
+            outputs = []
+        try:
+            outputs = [o.cpu().detach() for o in outputs]
+        except Exception:
+            # Try to coerce single-tensor return
+            if isinstance(outputs, torch.Tensor):
+                try:
+                    outputs = [outputs.cpu().detach()]
+                except Exception:
+                    outputs = []
+            else:
+                outputs = []
+
+        # If outputs is empty, skip this chunk
+        if len(outputs) == 0:
+            result_lengths.append(chunk.shape[-1])
+            del chunk
+            # ensure outputs removed
+            try:
+                del outputs
+            except Exception:
+                pass
+            continue
 
         # Handle variable number of model outputs (for compatibility)
         assert len(outputs) >= 2, "Model must return at least 2 outputs (probs, vels)"
@@ -295,7 +320,12 @@ class PedalDecoder(torch.nn.Module):
 
     @staticmethod
     def logits_to_probs(logits):
-        """Convert raw logits to probabilities using sigmoid."""
+        """Convert raw logits or already-normalized probabilities to probabilities."""
+        if isinstance(logits, torch.Tensor):
+            min_val = float(logits.min())
+            max_val = float(logits.max())
+            if 0.0 <= min_val and max_val <= 1.0:
+                return logits
         return torch.sigmoid(logits)
 
     @staticmethod

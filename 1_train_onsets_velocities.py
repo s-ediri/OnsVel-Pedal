@@ -174,8 +174,8 @@ class ConfDef:
     # loss
     ONSET_POSITIVES_WEIGHT: float = 3.0  # Increased - onsets are sparse, need higher weight
     VEL_LOSS_LAMBDA: float = 10.0
-    PEDAL_LOSS_LAMBDA: float = 1.0  # Increased - pedal detection is important for your use case
-    PEDAL_POSITIVES_WEIGHT: float = 3.0  # Increased - pedal presses are also sparse
+    PEDAL_LOSS_LAMBDA: float = 2.5  # Increased to 2.5x - pedal detection critical for transcription quality
+    PEDAL_POSITIVES_WEIGHT: float = 6.0  # Increased to 6.0 - sustain pedal is ~20-40% ON, need strong positive weight for sparse class
     TRAINABLE_ONSETS: bool = True
     # decoder
     DECODER_GAUSS_STD: float = 1
@@ -190,6 +190,9 @@ class ConfDef:
     # xv tolerances
     XV_TOLERANCE_SECS: float = 0.05
     XV_TOLERANCE_VEL: float = 0.1
+    # xv shortening
+    XV_SHORTEN: bool = False  # Whether to shorten the validation split for faster CV
+    XV_SHORTEN_FACTOR: int = 5  # Stride factor for shortening (e.g., 5 means keep every 5th sample)
 
 
 # ##############################################################################
@@ -210,8 +213,20 @@ if __name__ == "__main__":
                 reverse=True
             )
             if checkpoints:
-                CONF.SNAPSHOT_INPATH = os.path.join(checkpoint_dir, checkpoints[0])
-                print(f"[AUTO-RESUME] Found latest checkpoint: {CONF.SNAPSHOT_INPATH}")
+                for checkpoint in checkpoints:
+                    candidate_path = os.path.join(checkpoint_dir, checkpoint)
+                    if os.path.getsize(candidate_path) < 1024:
+                        print(f"[AUTO-RESUME] Skipping tiny or incomplete checkpoint: {candidate_path}")
+                        continue
+                    try:
+                        torch.load(candidate_path, map_location="cpu")
+                        CONF.SNAPSHOT_INPATH = candidate_path
+                        print(f"[AUTO-RESUME] Found latest valid checkpoint: {CONF.SNAPSHOT_INPATH}")
+                        break
+                    except Exception as exc:
+                        print(f"[AUTO-RESUME] Skipping invalid checkpoint {candidate_path}: {exc}")
+                if CONF.SNAPSHOT_INPATH is None:
+                    print("[AUTO-RESUME] No valid checkpoint found in model_snapshots.")
 
     # if no seed is given, take a random one
     if CONF.RANDOM_SEED is None:
@@ -279,10 +294,11 @@ if __name__ == "__main__":
     metamaestro_xv = METAMAESTRO_CLASS(
         CONF.MAESTRO_PATH, splits=["validation"],
         years=METAMAESTRO_CLASS.ALL_YEARS)
-    # shorten xv set to speed up cross validation times
-    txt_logger.loj("WARNING",
-                   "shortening xv split for faster crossvalidation!")
-    metamaestro_xv.data = metamaestro_xv.data[::5]
+    # Conditionally shorten xv set to speed up cross validation times
+    if CONF.XV_SHORTEN:
+        txt_logger.loj("WARNING",
+                       f"shortening xv split (factor={CONF.XV_SHORTEN_FACTOR}) for faster crossvalidation!")
+        metamaestro_xv.data = metamaestro_xv.data[::CONF.XV_SHORTEN_FACTOR]
     #
     maestro_xv = MelMaestro(
         CONF.HDF5_MEL_PATH, CONF.HDF5_ROLL_PATH,

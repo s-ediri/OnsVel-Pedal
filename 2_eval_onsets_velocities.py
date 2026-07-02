@@ -27,8 +27,7 @@ import gc
 # For omegaconf
 from dataclasses import dataclass
 from typing import Optional, List
-#
-from omegaconf import OmegaConf, MISSING
+from omegaconf import OmegaConf
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -39,9 +38,9 @@ from ov_piano.logging import ColorLogger
 from ov_piano.data.maestro import MetaMAESTROv1, MetaMAESTROv2, MetaMAESTROv3
 from ov_piano.data.maestro import MelMaestro
 from ov_piano.models.ov import OnsetsAndVelocities
-from ov_piano.inference import strided_inference, OnsetVelocityNmsDecoder
+from ov_piano.inference import strided_inference, OnsetVelocityNmsDecoder, PedalDecoder
 from ov_piano.eval import GtLoaderMaestro
-from ov_piano.eval import threshold_eval_single_file
+from ov_piano.eval import threshold_eval_single_file, threshold_eval_pedals
 
 # import matplotlib.pyplot as plt
 
@@ -107,7 +106,7 @@ class ConfDef:
     HDF5_ROLL_PATH: str = os.path.join(
         "datasets",
         "MAESTROv3_roll_quant=0.024_midivals=128_extendsus=True.h5")
-    SNAPSHOT_INPATH: str = os.path.join("out", "model_snapshots", "OnsetsAndVelocities_2026_02_07_11_29_44.362.torch")
+    SNAPSHOT_INPATH: str = os.path.join("out", "model_snapshots", "OnsetsAndVelocities_2026_06_28_04_08_45.096.torch")
     #
     CONV1X1: List[int] = (128, 128)  # MUST match checkpoint architecture!
     LEAKY_RELU_SLOPE: Optional[float] = 0.1
@@ -206,6 +205,8 @@ if __name__ == "__main__":
         gauss_conv_stddev=CONF.DECODER_GAUSS_STD,
         gauss_conv_ksize=CONF.DECODER_GAUSS_KSIZE,
         vel_pad_left=1, vel_pad_right=1)
+    # instantiate pedal decoder
+    pedal_decoder = PedalDecoder(num_pedals=1, threshold=0.5)
 
     ##############
     # XV INFERENCE
@@ -215,28 +216,79 @@ if __name__ == "__main__":
         Convenience wrapper around the DNN to ensure output and input sequences
         have same length.
         """
-        probs, vels, pedals = model(x)
-        probs = F.pad(torch.sigmoid(probs[-1]), (1, 0))
-        vels = F.pad(torch.sigmoid(vels), (1, 0))
-        # Note: pedals output is returned but not used in onset/velocity evaluation
-        return probs, vels
+        try:
+            out = model(x)
+            if out is None:
+                msg = "model_inference: model returned None"
+                txt_logger.error(msg)
+                return (), (), ()
 
-    xv_dataframes = []
+            out_type = type(out)
+            out_len = len(out) if hasattr(out, '__len__') else 'NA'
+            msg = f"model_inference: raw output type={out_type}, len={out_len}"
+            txt_logger.info(msg)
+
+            # If model returns a list/tuple of tensors, unpack
+            if isinstance(out, (list, tuple)) and len(out) >= 3:
+                probs, vels, pedals = out
+            else:
+                msg = f"model_inference: unexpected model output structure: type={out_type}, len={out_len}, value={out}"
+                txt_logger.error(msg)
+                return (), (), ()
+
+            if isinstance(probs, (list, tuple)):
+                msg = f"model_inference: probs is list/tuple len={len(probs)} -> using last stage"
+                txt_logger.info(msg)
+                probs = probs[-1]
+
+            msg = f"model_inference: probs shape={getattr(probs, 'shape', None)}, vels shape={getattr(vels, 'shape', None)}, pedals shape={getattr(pedals, 'shape', None)}"
+            txt_logger.info(msg)
+
+            probs = F.pad(torch.sigmoid(probs), (1, 0))
+            vels = F.pad(torch.sigmoid(vels), (1, 0))
+            # Pad pedal predictions to match sequence length
+            pedals = F.pad(torch.sigmoid(pedals), (1, 0))
+            return probs, vels, pedals
+        except Exception as e:
+            msg = f"model_inference exception: {e}"
+            txt_logger.error(msg)
+
     len_xv = len(maestro_xv)
+    xv_dataframes = []
     for i, (mel, roll, md) in enumerate(maestro_xv, 1):
         txt_logger.info(f"[{i}/{len_xv}] XV inference: {md}")
         try:
             with torch.no_grad():
                 tmel = torch.from_numpy(mel).to(CONF.DEVICE).unsqueeze(0)
-                onset_pred, vel_pred = strided_inference(
-                    model_inference, tmel, CHUNK_SIZE, CHUNK_OVERLAP)
+                # Skip empty inputs
+                if tmel.shape[-1] == 0:
+                    txt_logger.warning(f"SKIPPING {md[0]}: Empty mel input (0 frames)")
+                    del tmel
+                    continue
+
+                # Run strided inference and validate output
+                _res = strided_inference(model_inference, tmel, CHUNK_SIZE, CHUNK_OVERLAP)
                 del tmel
+                if not _res or len(_res) < 3:
+                    msg = f"SKIPPING {md[0]}: strided_inference returned invalid result: {type(_res)} len={len(_res) if hasattr(_res, '__len__') else 'NA'}"
+                    txt_logger.error(msg)
+                    continue
+
+                onset_pred, vel_pred, pedal_pred = _res
                 pred_df = decoder(
                     onset_pred, vel_pred, pthresh=min(CONF.SEARCH_THRESHOLDS))
+                # Process pedal predictions
+                if pedal_pred.dim() == 2:
+                    pedal_pred = pedal_pred.unsqueeze(0)  # Add batch dimension
 
                 # Safety check: skip files with excessive predictions
                 num_preds = len(pred_df)
                 gt_df = xv_gts(md)[0]
+                gt_pedal_df = xv_gts.get_sus_pedal_events(md, SECS_PER_FRAME)
+                # Add pedal_idx column for sustain pedal (index 0)
+                if not gt_pedal_df.empty:
+                    gt_pedal_df = gt_pedal_df.copy()
+                    gt_pedal_df['pedal_idx'] = 0
                 num_gt = len(gt_df)
 
                 if num_preds > CONF.MAX_PREDICTIONS_PER_FILE:
@@ -246,14 +298,19 @@ if __name__ == "__main__":
                     continue
 
                 txt_logger.info(f"  GT: {num_gt:,} notes, Pred: {num_preds:,} notes")
-                xv_dataframes.append((gt_df, pred_df))
+                xv_dataframes.append((gt_df, pred_df, gt_pedal_df, pedal_pred))
 
         except Exception as e:
             txt_logger.error(f"ERROR processing {md[0]}: {e}")
             continue
         finally:
-            # Aggressive memory cleanup
-            del mel, roll, onset_pred, vel_pred
+            # Aggressive memory cleanup (delete only defined names)
+            for v in ("mel", "roll", "onset_pred", "vel_pred", "pedal_pred", "tmel", "_res"):
+                if v in locals():
+                    try:
+                        del locals()[v]
+                    except Exception:
+                        pass
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -276,21 +333,51 @@ if __name__ == "__main__":
 
     xv_gridsearch = {}
     xv_gridsearch_vel = {}
+    xv_gridsearch_pedal = {}
     for thresh in CONF.SEARCH_THRESHOLDS:
         for shift in CONF.SEARCH_SHIFTS:
             this_eval = []
             this_eval_vel = []
-            for i, (gtdf, preddf) in enumerate(xv_dataframes, 1):
-                txt_logger.info(f"[{i}/{len_xv} (xv set)]: {(thresh, shift)}")
+            this_eval_pedal = []
+
+            for i, (gtdf, preddf, gt_pedal_df, pedal_pred) in enumerate(xv_dataframes, 1):
+                txt_logger.info(f"[{i}/{len(xv_dataframes)} XV]: {(thresh, shift)}")
+
+                # Note onsets
                 prf1, prf1_v = threshold_eval_single_file(
                     gtdf, preddf, SECS_PER_FRAME, key_beg,
                     thresh=thresh, shift_preds=shift,
-                    tol_secs=CONF.TOLERANCE_SECS, tol_vel=CONF.TOLERANCE_VEL)
+                    tol_secs=CONF.TOLERANCE_SECS,
+                    tol_vel=CONF.TOLERANCE_VEL
+                )
+
+                # Sustain pedal ONLY
+                try:
+                    pedal_results = threshold_eval_pedals(
+                        gt_pedal_df,
+                        pedal_pred,
+                        SECS_PER_FRAME,
+                        thresh=0.5,
+                        tol_secs=CONF.TOLERANCE_SECS
+                    )
+
+                    if "sustain" in pedal_results:
+                        s = pedal_results["sustain"]
+                        pedal_prf1 = (s["precision"], s["recall"], s["f1"])
+                    else:
+                        pedal_prf1 = (0.0, 0.0, 0.0)
+
+                except Exception as e:
+                    txt_logger.warning(f"Pedal eval failed: {e}")
+                    pedal_prf1 = (0.0, 0.0, 0.0)
+
                 this_eval.append(prf1)
                 this_eval_vel.append(prf1_v)
+                this_eval_pedal.append(pedal_prf1)
+
             xv_gridsearch[(thresh, shift)] = this_eval
             xv_gridsearch_vel[(thresh, shift)] = this_eval_vel
-    # Compute mean metrics ensuring proper array shape
+            xv_gridsearch_pedal[(thresh, shift)] = this_eval_pedal    # Compute mean metrics ensuring proper array shape
     xv_summary = {}
     for k, v in xv_gridsearch.items():
         mean_val = np.mean(v, axis=0)
@@ -305,7 +392,14 @@ if __name__ == "__main__":
         if mean_val.ndim == 0:
             mean_val = np.array([mean_val, mean_val, mean_val])
         xv_summary_vel[k] = mean_val
-
+    
+    xv_summary_pedal = {}
+    for k, v in xv_gridsearch_pedal.items():
+        v = np.asarray(v)
+        if v.ndim != 2 or v.shape[1] != 3:
+            xv_summary_pedal[k] = np.array([0.0, 0.0, 0.0])
+        else:
+            xv_summary_pedal[k] = v.mean(axis=0)
     # Find best threshold/shift based on F1 score
     try:
         ((best_t, best_s), (best_p, best_r, best_f1)) = max(
@@ -324,28 +418,42 @@ if __name__ == "__main__":
     xv_summary_df_vel = pd.DataFrame(
         ((t, s, p, r, f1) for ((t, s), (p, r, f1)) in xv_summary_vel.items()),
         columns=["threshold", "shift", "P", "R", "F1"])
+    
+    xv_summary_df_pedal = pd.DataFrame(
+        ((t, s, p, r, f1) for ((t, s), (p, r, f1)) in xv_summary_pedal.items()),
+        columns=["threshold", "shift", "P", "R", "F1"])
 
     txt_logger.warning("XV HYPERPARAMETER SEARCH:")
     txt_logger.warning("Summary (without velocity):\n" + str(xv_summary_df))
     txt_logger.warning("Summary (with velocity):\n" + str(xv_summary_df_vel))
+    txt_logger.warning("Summary (sustain pedal):\n" + str(xv_summary_df_pedal))
 
     ###############
     # TEST
     ###############
     test_results = []
     test_results_vel = []
+    test_results_pedal = []
     len_test = len(maestro_test)
     for i, (mel, roll, md) in enumerate(maestro_test, 1):
         txt_logger.info(f"[{i}/{len_test} (test set)] {md}")
         try:
             with torch.no_grad():
                 tmel = torch.from_numpy(mel).to(CONF.DEVICE).unsqueeze(0)
-                onset_pred, vel_pred = strided_inference(
+                onset_pred, vel_pred, pedal_pred = strided_inference(
                     model_inference, tmel, CHUNK_SIZE, CHUNK_OVERLAP)
                 del tmel
                 pred_df = decoder(
                     onset_pred, vel_pred, pthresh=min(CONF.SEARCH_THRESHOLDS))
                 gt_df = test_gts(md)[0]
+                gt_pedal_df = test_gts.get_sus_pedal_events(md, SECS_PER_FRAME)
+                # Add pedal_idx column for sustain pedal (index 0)
+                if not gt_pedal_df.empty:
+                    gt_pedal_df = gt_pedal_df.copy()
+                    gt_pedal_df['pedal_idx'] = 0
+                # Process pedal predictions
+                if pedal_pred.dim() == 2:
+                    pedal_pred = pedal_pred.unsqueeze(0)  # Add batch dimension
 
             # Safety check: skip files with excessive predictions
             num_preds = len(pred_df)
@@ -363,15 +471,35 @@ if __name__ == "__main__":
                 gt_df, pred_df, SECS_PER_FRAME, key_beg,
                 thresh=best_t, shift_preds=best_s,
                 tol_secs=CONF.TOLERANCE_SECS, tol_vel=CONF.TOLERANCE_VEL)
+            # Evaluate pedal predictions
+            try:
+                pedal_results = threshold_eval_pedals(
+                    gt_pedal_df, pedal_pred, SECS_PER_FRAME,
+                    thresh=0.5, tol_secs=CONF.TOLERANCE_SECS)
+                # Extract sustain pedal metrics (index 0)
+                if 'sustain' in pedal_results:
+                    pedal_prf1 = (
+                        pedal_results['sustain']['precision'],
+                        pedal_results['sustain']['recall'],
+                        pedal_results['sustain']['f1']
+                    )
+                else:
+                    # Fallback if no sustain pedal results
+                    pedal_prf1 = (0.0, 0.0, 0.0)
+            except Exception as e:
+                txt_logger.warning(f"Pedal evaluation failed for {md[0]}: {e}")
+                pedal_prf1 = (0.0, 0.0, 0.0)
+            
             test_results.append((md[0], *prf1))
             test_results_vel.append((md[0], *prf1_v))
+            test_results_pedal.append((md[0], *pedal_prf1))
 
         except Exception as e:
             txt_logger.error(f"ERROR processing {md[0]}: {e}")
             continue
         finally:
             # Aggressive memory cleanup
-            del mel, roll, onset_pred, vel_pred, pred_df, gt_df
+            del mel, roll, onset_pred, vel_pred, pedal_pred, pred_df, gt_df, gt_pedal_df
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -388,6 +516,12 @@ if __name__ == "__main__":
                     *test_results_df_vel.iloc[:, 1:].mean().tolist()]
     test_results_df_vel.loc[len(test_results_df_vel)] = averages_vel
     #
+    test_results_df_pedal = pd.DataFrame(
+        test_results_pedal, columns=["Filename", "P", "R", "F1"])
+    averages_pedal = [f"AVERAGES (t={best_t}, s={best_s})",
+                      *test_results_df_pedal.iloc[:, 1:].mean().tolist()]
+    test_results_df_pedal.loc[len(test_results_df_pedal)] = averages_pedal
+    #
     txt_logger.warning("TEST RESULTS WITH BEST XV HYPERPARS " +
                        f"(MAESTROv{CONF.MAESTRO_VERSION}, " +
                        f"{CONF.SNAPSHOT_INPATH})\n")
@@ -395,3 +529,13 @@ if __name__ == "__main__":
         "ONSETS:\n" + str(test_results_df))
     txt_logger.warning(
         "ONSETS+VELOCITIES:\n" + str(test_results_df_vel))
+    txt_logger.warning(
+        "SUSTAIN PEDAL:\n" + str(test_results_df_pedal))
+    
+    # Export full results to CSV
+    csv_dir = "out_test/results_csv"
+    os.makedirs(csv_dir, exist_ok=True)
+    test_results_df.to_csv(f"{csv_dir}/test_onsets_results.csv", index=False)
+    test_results_df_vel.to_csv(f"{csv_dir}/test_velocities_results.csv", index=False)
+    test_results_df_pedal.to_csv(f"{csv_dir}/test_pedal_results.csv", index=False)
+    txt_logger.warning(f"Results exported to {csv_dir}/")

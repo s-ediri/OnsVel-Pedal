@@ -204,7 +204,10 @@ def save_model(model, path):
 def load_model(model, path, eval_phase=True, strict=True, to_cpu=False):
     """
     """
-    state_dict = torch.load(path, map_location="cpu" if to_cpu else None)
+    try:
+        state_dict = torch.load(path, map_location="cpu" if to_cpu else None)
+    except RuntimeError as exc:
+        raise RuntimeError(f"Failed to load PyTorch checkpoint '{path}': {exc}") from exc
     model.load_state_dict(state_dict, strict=strict)
     if eval_phase:
         model.eval()
