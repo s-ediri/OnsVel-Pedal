@@ -3,6 +3,8 @@ datasets/*
 # if symlink
 datasets
 out/*
+.claude
+_archived_files
 
 
 # Byte-compiled / optimized / DLL files
