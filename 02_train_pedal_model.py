@@ -3,14 +3,14 @@
 
 
 """
-This module instantiates, trains and cross-validates a (potentially pre-loaded)
-deep learning model for piano key onset+velocity detection on the MAESTRO
+This module instantiates, trains and cross-validates a pedal-aware deep learning
+model for piano onset, velocity, and sustain-pedal prediction on the MAESTRO
 dataset.
 
 It is structured in 3 parts:
 1. Fetching and preparing global parameters
 2. Instantiating required parts (dataloader, model, decoder, optimizer...)
-3. Training loop, featuring an inner cross-validation loop
+3. Training loop, featuring an inner cross-validation loop for note and pedal metrics
 """
 
 
@@ -611,11 +611,21 @@ if __name__ == "__main__":
                 velocities, onsets_norm, mask=onsets_clip)
             
             # Sustain pedal loss - binary cross entropy between predicted and target sustain pedal
-            # pedals: (b, 1, t) - model's sustain pedal logits  
+            # pedals: (b, 1, t) - model's sustain pedal logits
             # sustain_norm: (b, 1, t) - target sustain pedal from MIDI (normalized 0-1)
-            # Both reshaped to 1D for loss computation
+            # We emphasize transition regions so the model learns onset/offset timing more reliably.
+            pedal_logits = pedals.reshape(-1)
+            pedal_targets = sustain_norm.reshape(-1)
+            pedal_weights = torch.ones_like(pedal_targets)
+            pedal_transition_mask = torch.abs(
+                sustain_norm[..., 1:] - sustain_norm[..., :-1]).squeeze(1)
+            if pedal_transition_mask.numel() > 0:
+                pedal_transition_weights = torch.ones_like(pedal_transition_mask)
+                pedal_transition_weights += pedal_transition_mask
+                pedal_weights[1:] += pedal_transition_weights.reshape(-1)
             pedal_loss = CONF.PEDAL_LOSS_LAMBDA * torch.nn.functional.binary_cross_entropy_with_logits(
-                pedals.reshape(-1), sustain_norm.reshape(-1), pos_weight=pedal_pos_weight)
+                pedal_logits, pedal_targets, pos_weight=pedal_pos_weight, reduction='none')
+            pedal_loss = (pedal_loss * pedal_weights).mean()
             
             loss = vel_loss + pedal_loss
             if CONF.TRAINABLE_ONSETS:

@@ -300,23 +300,31 @@ class OnsetVelocityNmsDecoder(torch.nn.Module):
 class PedalDecoder(torch.nn.Module):
     """
     Decoder for piano pedal events (sustain, soft, tenuto).
-    
+
     Given a tensor of raw logits for pedal predictions, this decoder:
     1. Converts logits to probabilities (sigmoid)
-    2. Detects pedal state transitions (on/off events)
-    3. Returns pedal events as onset/offset pairs
-    
+    2. Smooths the sequence slightly to reduce jitter
+    3. Detects pedal state transitions using hysteresis and minimum hold time
+    4. Returns pedal events as onset/offset pairs
+
     Each pedal is treated independently as a binary state machine.
     """
 
-    def __init__(self, num_pedals=3, threshold=0.5):
+    def __init__(self, num_pedals=3, threshold=0.5, hysteresis=0.1,
+                 min_hold_steps=2, smoothing_window=3):
         """
         :param num_pedals: Number of pedal types (default: 3 for sustain, soft, tenuto)
         :param threshold: Probability threshold for pedal activation
+        :param hysteresis: Margin used to avoid rapid chatter around the threshold
+        :param min_hold_steps: Minimum number of frames a state must persist before changing
+        :param smoothing_window: Small moving-average window for the probability sequence
         """
         super().__init__()
         self.num_pedals = num_pedals
         self.threshold = threshold
+        self.hysteresis = hysteresis
+        self.min_hold_steps = max(1, int(min_hold_steps))
+        self.smoothing_window = max(1, int(smoothing_window))
 
     @staticmethod
     def logits_to_probs(logits):
@@ -328,31 +336,63 @@ class PedalDecoder(torch.nn.Module):
                 return logits
         return torch.sigmoid(logits)
 
-    @staticmethod
-    def detect_transitions(probs, threshold=0.5):
+    def _smooth_probs(self, probs):
+        """Apply a small moving-average smoothing over time."""
+        if self.smoothing_window <= 1 or probs.shape[-1] <= 1:
+            return probs
+        b, p, t = probs.shape
+        flat = probs.reshape(-1, 1, t)
+        kernel = torch.ones(1, 1, self.smoothing_window,
+                            device=probs.device, dtype=probs.dtype)
+        kernel /= self.smoothing_window
+        padded = F.pad(flat, (self.smoothing_window // 2,
+                              self.smoothing_window // 2),
+                       mode="replicate")
+        smoothed = F.conv1d(padded, kernel)
+        return smoothed.reshape(b, p, t)
+
+    def detect_transitions(self, probs):
         """
-        Detect state transitions in pedal activation.
+        Detect state transitions in pedal activation using hysteresis.
         Returns onset and offset indices for each pedal.
-        
+
         :param probs: Tensor of shape (b, num_pedals, t) with values in [0, 1]
-        :param threshold: Probability threshold for considering pedal "on"
-        :returns: Dictionary with "onsets" and "offsets" tensors
+        :returns: Dictionary with "onsets", "offsets", and "states" tensors
         """
-        # Binarize: 1 if prob >= threshold, 0 otherwise
-        states = (probs >= threshold).float()
-        
-        # Detect transitions by comparing consecutive time steps
-        # Pad at beginning to detect onset at t=0
-        padded_states = F.pad(states, (1, 0), mode='constant', value=0.0)
-        
-        # Transition = difference between consecutive states
-        transitions = padded_states[..., 1:] - padded_states[..., :-1]
-        
-        # Onsets: transitions from 0 to 1 (positive transitions)
-        onsets = transitions > 0
-        # Offsets: transitions from 1 to 0 (negative transitions)
-        offsets = transitions < 0
-        
+        smoothed_probs = self._smooth_probs(probs)
+        probs = 0.7 * probs + 0.3 * smoothed_probs
+        b, p, t = probs.shape
+        states = torch.zeros((b, p, t), device=probs.device, dtype=torch.float32)
+        onsets = torch.zeros((b, p, t), device=probs.device, dtype=torch.bool)
+        offsets = torch.zeros((b, p, t), device=probs.device, dtype=torch.bool)
+
+        prev_states = torch.zeros((b, p), device=probs.device, dtype=torch.float32)
+        last_change = torch.full((b, p), -self.min_hold_steps,
+                                 device=probs.device, dtype=torch.long)
+        upper = self.threshold + self.hysteresis
+        lower = self.threshold - self.hysteresis
+
+        for step in range(t):
+            current_probs = probs[..., step]
+            next_states = prev_states.clone()
+            for batch_idx in range(b):
+                for pedal_idx in range(p):
+                    prob = float(current_probs[batch_idx, pedal_idx])
+                    prev_state = int(prev_states[batch_idx, pedal_idx])
+                    time_since_change = step - int(last_change[batch_idx, pedal_idx])
+                    if prev_state == 0 and prob >= upper:
+                        if time_since_change >= self.min_hold_steps:
+                            next_states[batch_idx, pedal_idx] = 1.0
+                            onsets[batch_idx, pedal_idx, step] = True
+                            last_change[batch_idx, pedal_idx] = step
+                    elif prev_state == 1 and prob <= lower:
+                        if time_since_change >= self.min_hold_steps:
+                            next_states[batch_idx, pedal_idx] = 0.0
+                            offsets[batch_idx, pedal_idx, step] = True
+                            last_change[batch_idx, pedal_idx] = step
+            states[..., step] = next_states
+            prev_states = next_states
+
         return {"onsets": onsets, "offsets": offsets, "states": states}
 
     def forward(self, pedal_logits):
@@ -363,38 +403,28 @@ class PedalDecoder(torch.nn.Module):
         b, p, t = pedal_logits.shape
         assert p == self.num_pedals, \
             f"Expected {self.num_pedals} pedals, got {p}"
-        
+
         with torch.no_grad():
-            # Convert logits to probabilities
             probs = self.logits_to_probs(pedal_logits)
-            
-            # Detect transitions
-            transitions = self.detect_transitions(probs, self.threshold)
-        
-        # Extract events as dataframes per batch/pedal
+            transitions = self.detect_transitions(probs)
+
         batch_indices, pedal_indices, time_indices = transitions["onsets"].nonzero(as_tuple=True)
-        
-        # Create dataframe for onset events
         onset_df = pd.DataFrame({
             "batch_idx": batch_indices.cpu(),
-            "pedal_idx": pedal_indices.cpu(),  # 0=sustain, 1=soft, 2=tenuto
+            "pedal_idx": pedal_indices.cpu(),
             "t_idx": time_indices.cpu(),
             "event_type": "onset"
         })
-        
-        # Extract offset events
+
         batch_indices, pedal_indices, time_indices = transitions["offsets"].nonzero(as_tuple=True)
-        
         offset_df = pd.DataFrame({
             "batch_idx": batch_indices.cpu(),
             "pedal_idx": pedal_indices.cpu(),
             "t_idx": time_indices.cpu(),
             "event_type": "offset"
         })
-        
-        # Combine and sort by time
+
         events_df = pd.concat([onset_df, offset_df], ignore_index=True)
         events_df = events_df.sort_values(["batch_idx", "t_idx"]).reset_index(drop=True)
-        
-        # Also return probability maps for threshold analysis
+
         return events_df, probs, transitions["states"]

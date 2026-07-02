@@ -28,7 +28,7 @@ Close these applications:
 **In onsvel environment:**
 ```bash
 conda activate onsvel
-cd E:\FYP\iamusica_training
+cd D:\FYP\OnV+Pedal
 python 1_train_onsets_velocities.py
 ```
 

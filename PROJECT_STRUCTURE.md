@@ -1,16 +1,16 @@
-# Project Structure - Piano Transcription with Sustain Pedal
+# Project Structure - OnV+Pedal
 
 ## Clean Directory Layout
 
 ```
-iamusica_training/
+OnV+Pedal/
 ├── 📄 Core Scripts (6 files)
-│   ├── 0a_maestro_to_hdf5mel.py      # Preprocess MAESTRO dataset to HDF5
-│   ├── 0b_maps_to_hdf5mel.py         # Preprocess MAPS dataset to HDF5
-│   ├── 1_train_onsets_velocities.py  # Training script (with pedal support)
-│   ├── 2_eval_onsets_velocities.py   # Evaluation script (FIXED)
-│   ├── 3_analyze_logs.py             # Training log analysis
-│   └── 4_qualitative_plots.py        # Generate visualization plots
+│   ├── 00_prepare_maestro_hdf5.py    # Preprocess MAESTRO dataset to HDF5
+│   ├── 01_prepare_maps_hdf5.py       # Preprocess MAPS dataset to HDF5
+│   ├── 02_train_pedal_model.py       # Training script (with pedal support)
+│   ├── 03_evaluate_pedal_model.py    # Evaluation script (FIXED)
+│   ├── 05_analyze_training_logs.py   # Training log analysis
+│   └── 06_visualize_pedal_predictions.py # Generate visualization plots
 │
 ├── 📁 ov_piano/ - Core Module
 │   ├── __init__.py
@@ -31,7 +31,7 @@ iamusica_training/
 │       └── building_blocks.py        # Neural network components
 │
 ├── 📚 Documentation (3 files)
-│   ├── README.md                     # Original project documentation
+│   ├── README.md                     # Pedal-focused project documentation
 │   ├── EVALUATION_FIXES_SUMMARY.md   # Comprehensive fixes & architecture
 │   └── QUICK_START_EVALUATION.md     # Quick start evaluation guide
 │
@@ -63,22 +63,22 @@ iamusica_training/
 ### Training
 ```bash
 conda activate onsvel
-python 1_train_onsets_velocities.py
+python 02_train_pedal_model.py
 ```
 
 ### Evaluation
 ```bash
-python 2_eval_onsets_velocities.py
+python 03_evaluate_pedal_model.py
 ```
 
 ### Log Analysis
 ```bash
-python 3_analyze_logs.py LOG_PATH="out/txt_logs/YOUR_LOG.json"
+python 05_analyze_training_logs.py LOG_PATH="out/txt_logs/YOUR_LOG.json"
 ```
 
 ### Visualization
 ```bash
-python 4_qualitative_plots.py SNAPSHOT_INPATH="out/model_snapshots/YOUR_MODEL.torch"
+python 06_visualize_pedal_predictions.py SNAPSHOT_INPATH="out/model_snapshots/YOUR_MODEL.torch"
 ```
 
 ---

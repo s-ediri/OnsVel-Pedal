@@ -1,4 +1,4 @@
-# Training Guide: 3-5 Day Optimized Training
+# Training Guide: 3-5 Day Pedal-Aware Training
 
 ## Configuration Changes
 
@@ -53,7 +53,7 @@ rm out/model_snapshots/.resume_state.json
 conda activate onsvel
 
 # Start training
-python 1_train_onsets_velocities.py
+python 02_train_pedal_model.py
 ```
 
 ### Step 2: Monitor Progress
@@ -136,12 +136,12 @@ out/model_snapshots/
 ### Check Training Logs:
 ```bash
 # View latest log
-tail -f out/txt_logs/[1_train_onsets_velocities.py]*.log
+tail -f out/txt_logs/[02_train_pedal_model.py]*.log
 ```
 
 ### Check Loss Trends:
 ```bash
-python 3_analyze_logs.py LOG_PATH="out/txt_logs/YOUR_LOG.json"
+python 05_analyze_training_logs.py LOG_PATH="out/txt_logs/YOUR_LOG.json"
 ```
 
 ---
@@ -152,7 +152,7 @@ The training script **auto-resumes** from the latest checkpoint:
 
 ```bash
 # Just restart - it will continue where it left off
-python 1_train_onsets_velocities.py
+python 02_train_pedal_model.py
 ```
 
 **Resume state saved every 500 steps in:**
@@ -164,7 +164,7 @@ python 1_train_onsets_velocities.py
 
 ### Step 1: Evaluate on Test Set
 ```bash
-python 2_eval_test_only.py
+python 04_evaluate_test_split.py
 ```
 
 You should now see:
@@ -174,12 +174,12 @@ You should now see:
 
 ### Step 2: Generate Plots
 ```bash
-python 4_qualitative_plots.py
+python 06_visualize_pedal_predictions.py
 ```
 
 ### Step 3: Analyze Logs
 ```bash
-python 3_analyze_logs.py
+python 05_analyze_training_logs.py
 ```
 
 ---
@@ -197,13 +197,13 @@ With these settings:
 
 ### Reduce Epochs (Less Quality)
 ```bash
-python 1_train_onsets_velocities.py NUM_EPOCHS=5
+python 02_train_pedal_model.py NUM_EPOCHS=5
 ```
 **Time:** ~6-8 hours (1 day max)
 
 ### Increase Chunk Size (More Memory, Faster)
 ```bash
-python 1_train_onsets_velocities.py TRAIN_BATCH_SECS=5.0
+python 02_train_pedal_model.py TRAIN_BATCH_SECS=5.0
 ```
 **Time:** ~8-10 hours (slightly faster)
 
@@ -231,7 +231,7 @@ python 1_train_onsets_velocities.py TRAIN_BATCH_SECS=5.0
 
 ```bash
 conda activate onsvel
-python 1_train_onsets_velocities.py
+python 02_train_pedal_model.py
 ```
 
 **The training will complete in 1-2 days, well within your 3-5 day target!**

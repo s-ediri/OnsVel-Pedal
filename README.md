@@ -1,26 +1,30 @@
-# iamusica_training
-
+# OnV+Pedal: Pedal-Aware Piano Onset, Velocity, and Sustain Pedal Prediction
 
 <p align="center">
-<img src="assets/qualitative_plot_bone_small.png" alt="Onsets and Velocities input/output example" width="60.0%"/>
+<img src="assets/qualitative_plot_bone_small.png" alt="Pedal-aware piano transcription input/output example" width="60.0%"/>
 </p>
 
-The present repository hosts the software needed to train and evaluate the Deep Learning piano onset+velocity detection model presented in our [paper](https://arxiv.org/abs/2303.04485): *Onsets and Velocities: Affordable Real-Time Piano Transcription Using Convolutional Neural Networks*. Specifically, it provides the means to:
-* Install the required software dependencies
-* Download and preprocess the required dataset
-* Run and evaluate (pre)trained models
-* Train models from scratch
+This repository contains a pedal-focused adaptation of a piano transcription pipeline for predicting onsets, velocities, and sustain pedal events from audio. It builds on the original onset/velocity training framework from the iamusica_training project, but it has been substantially reworked and extended to make sustain-pedal prediction a first-class objective.
 
-See [this companion repository](https://github.com/andres-fr/iamusica_demo) for a real-time, graphical software demonstration.
+The project is designed to:
+* install the required software dependencies
+* download and preprocess the required datasets
+* train and evaluate models for onset, velocity, and pedal prediction
+* analyze checkpoints and generate qualitative visualizations
 
-<img src="assets/iamusica_logo.jpg" alt="IAMúsica logo" width="41.5%"/> <img src="assets/ieb_logo.jpg" alt="IEB logo" width="54%"/>
+This repository is intentionally differentiated by its focus on sustain-pedal detection, which is treated as a core prediction target rather than an auxiliary add-on.
 
-*O&V was developed in the context of the [IAMúsica](https://joantrave.net/en/iamusica/) project, supported by research grant [389062, INV-23/2021](http://www.iebalearics.org/media/files/2022/02/10/resolucio-definitiva-inv-boib-2021-cat.pdf) from the [Institut d'Estudis Baleàrics](http://www.iebalearics.org/ca/), and composed by:*
-* [Eulàlia Febrer Coll](https://www.researchgate.net/profile/Eulalia-Febrer-Coll)
-* [Joan Lluís Travé Pla](https://joantrave.net/en)
-* [Andrés Fernández Rodríguez](https://aferro.dynu.net)
+## What makes this project unique
 
-This is [Free/Libre and Open Source Software](https://www.gnu.org/philosophy/floss-and-foss.en.html), see the [LICENSE](LICENSE) for more details. If you use this work, please consider citing the [paper](https://arxiv.org/abs/2303.04485):
+- It is a pedal-aware extension of piano transcription, with sustain-pedal events modeled alongside onsets and velocities.
+- The workflow is oriented toward evaluating and improving pedal prediction quality, not only note transcription.
+- The repository structure and documentation are tailored for a pedal-focused training and evaluation pipeline.
+
+Credit and attribution:
+* The original onset/velocity model architecture and training workflow were inspired by the iamusica_training project by Andrés Fernández Rodríguez and collaborators.
+* The pedal-prediction extensions, repository structure, and current evaluation workflow in this project are original to this adaptation.
+
+This is [Free/Libre and Open Source Software](https://www.gnu.org/philosophy/floss-and-foss.en.html), see the [LICENSE](LICENSE) for more details. If you use this adapted work, please also credit the original paper: [Onsets and Velocities: Affordable Real-Time Piano Transcription Using Convolutional Neural Networks](https://arxiv.org/abs/2303.04485)
 
 ```
 @inproceedings{onsvel,
@@ -138,7 +142,7 @@ To train the model, we represent the audio as log-mel spectrograms and the annot
 Assuming `MAESTROv3` is in `datasets/maestro/maestro-v3.0.0`, preprocessing with the default parameters can be done by simply calling the following script:
 
 ```
-python 0a_maestro_to_hdf5mel.py
+python 00_prepare_maestro_hdf5.py
 ```
 
 Which will generate the `logmels` and `roll` inside the provided `OUTPUT_DIR` (default: `datasets`). Processing MAESTRO with our default parameters takes about 30min on a mid-end 16-core CPU; the piano roll HDF5 file takes about 0.5GB of space, and the log-mel file about 22.5GB.
@@ -154,14 +158,14 @@ Which will generate the `logmels` and `roll` inside the provided `OUTPUT_DIR` (d
 The script also allows to precompute former maestro versions:
 
 ```
-python 0a_maestro_to_hdf5mel.py MAESTRO_VERSION=1 MAESTRO_INPATH=datasets/maestro/maestro-v1.0.0
-python 0a_maestro_to_hdf5mel.py MAESTRO_VERSION=2 MAESTRO_INPATH=datasets/maestro/maestro-v2.0.0
+python 00_prepare_maestro_hdf5.py MAESTRO_VERSION=1 MAESTRO_INPATH=datasets/maestro/maestro-v1.0.0
+python 00_prepare_maestro_hdf5.py MAESTRO_VERSION=2 MAESTRO_INPATH=datasets/maestro/maestro-v2.0.0
 ```
 
 To precompute MAPS with default parameters (assuming it is inside `datasets/MAPS`):
 
 ```
-python 0b_maps_to_hdf5mel.py
+python 01_prepare_maps_hdf5.py
 ```
 
 Processing `MAPS` with the default settings takes about 20min on a 16-core CPU. The piano roll HDF5 file takes about 100MB of space, and the log-mel file about 4GB.
@@ -175,14 +179,14 @@ Processing `MAPS` with the default settings takes about 20min on a 16-core CPU. 
 
 ---
 
-# Running/evaluating the model
+# Running and evaluating the pedal-aware model
 
-This repository also hosts an instance of a [pretrained model](assets/OnsetsAndVelocities_2023_03_04_09_53_53.289step=43500_f1=0.9675__0.9480.torch). The evaluation script can be run on the pretrained model with default parameters as follows:
+This repository includes support for evaluating a pretrained model checkpoint such as [assets/OnsetsAndVelocities_2023_03_04_09_53_53.289step=43500_f1=0.9675__0.9480.torch](assets/OnsetsAndVelocities_2023_03_04_09_53_53.289step=43500_f1=0.9675__0.9480.torch). The evaluation script can be run with default parameters as follows:
 
 
 
 ```
-python 2_eval_onsets_velocities.py SNAPSHOT_INPATH=assets/OnsetsAndVelocities_2023_03_04_09_53_53.289step=43500_f1=0.9675__0.9480.torch
+python 03_evaluate_pedal_model.py SNAPSHOT_INPATH=assets/OnsetsAndVelocities_2023_03_04_09_53_53.289step=43500_f1=0.9675__0.9480.torch
 ```
 
 Yielding the following results after a few minutes:
@@ -203,7 +207,7 @@ ONS+VEL (t=0.74, s=-0.01)  0.962538    0.928580  0.945033
 For adequate training, a GPU with at least 8GB of memory is sufficient. The following command trains a model from scratch on `MAESTROv3`:
 
 ```
-python 1_train_onsets_velocities.py
+python 02_train_pedal_model.py
 ```
 
 The following is an excerpt from the default configuration that led to the results reported in our paper:
@@ -243,7 +247,7 @@ The model is periodically cross-validated and saved under `OUTPUT_DIR`, for furt
 Since the log is a collection of JSON objects, its processing can be easily streamlined. The following script is an example, plotting the cross-validation metrics and fetching the maximum (requires `matplotlib`):
 
 ```
-python 3_analyze_logs.py PLOT_RANGE="[0.90, 0.97]" LOG_PATH=<...>
+python 05_analyze_training_logs.py PLOT_RANGE="[0.90, 0.97]" LOG_PATH=<...>
 ```
 
 
@@ -276,5 +280,5 @@ The qualitative plot used in the [paper](https://arxiv.org/abs/2303.04485) can b
 
 
 ```
-python 4_qualitative_plots.py SNAPSHOT_INPATH=assets/OnsetsAndVelocities_2023_03_04_09_53_53.289step\=43500_f1\=0.9675__0.9480.torch OUTPUT_DIR=out
+python 06_visualize_pedal_predictions.py SNAPSHOT_INPATH=assets/OnsetsAndVelocities_2023_03_04_09_53_53.289step\=43500_f1\=0.9675__0.9480.torch OUTPUT_DIR=out
 ```

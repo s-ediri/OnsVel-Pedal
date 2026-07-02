@@ -277,10 +277,10 @@ if __name__ == "__main__":
         pedals = F.pad(torch.sigmoid(pedals), (1, 0))
         return probs, vels, pedals
 
-test_results = []
-test_results_vel = []
-len_test = len(maestro_test)
-for i, (mel, roll, md) in enumerate(maestro_test, 1):
+    test_results = []
+    test_results_vel = []
+    len_test = len(maestro_test)
+    for i, (mel, roll, md) in enumerate(maestro_test, 1):
         txt_logger.info(f"[{i}/{len_test} (test set)] {md}")
         onsets = (roll[onsets_beg:onsets_end][key_beg:key_end] > 0)
         triple_onsets = make_triple_onsets(onsets)
@@ -294,7 +294,7 @@ for i, (mel, roll, md) in enumerate(maestro_test, 1):
             onset_pred = onset_pred.cpu().numpy().squeeze()
             vel_pred = vel_pred.cpu().numpy().squeeze()
 
-    def qplot_ranged(min_idx=None, max_idx=None):
+        def qplot_ranged(min_idx=None, max_idx=None):
             """
             Closure to inspect ranges flexibly via one-liners like::
               qplot_ranged(0, 1000)[0].show()

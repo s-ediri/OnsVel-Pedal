@@ -416,7 +416,7 @@ def threshold_eval_pedals(gt_pedal_events, pred_pedal_probs, secs_per_frame,
                           thresh=0.5, shift_preds=0, tol_secs=0.05):
     """
     Evaluate pedal event detection with thresholding.
-    
+
     :param gt_pedal_events: Ground truth pedal events dataframe with columns
       [onset, pedal_idx, event_type]
     :param pred_pedal_probs: Predicted pedal probabilities (b, num_pedals, t)
@@ -428,12 +428,10 @@ def threshold_eval_pedals(gt_pedal_events, pred_pedal_probs, secs_per_frame,
     """
     from .inference import PedalDecoder
     import torch
-    
-    # Ensure pred_pedal_probs is a tensor with correct shape
+
     if not isinstance(pred_pedal_probs, torch.Tensor):
         pred_pedal_probs = torch.tensor(pred_pedal_probs)
 
-    # Normalize tensor dimensions to (batch, num_pedals, time)
     if pred_pedal_probs.dim() > 3:
         shape = pred_pedal_probs.shape
         batch_size = int(np.prod(shape[:-2]))
@@ -448,7 +446,6 @@ def threshold_eval_pedals(gt_pedal_events, pred_pedal_probs, secs_per_frame,
     elif pred_pedal_probs.dim() == 0:
         pred_pedal_probs = pred_pedal_probs.view(1, 1, 1)
 
-    # Ensure shape is now (b, num_pedals, t)
     if pred_pedal_probs.dim() != 3:
         raise ValueError(
             f"Unexpected pred_pedal_probs shape after normalization: {pred_pedal_probs.shape}"
@@ -462,11 +459,9 @@ def threshold_eval_pedals(gt_pedal_events, pred_pedal_probs, secs_per_frame,
                 "macro_avg": {"precision": 0.0, "recall": 0.0, "f1": 0.0}}
 
     try:
-        # Decode pedal events from probabilities or logits
         decoder = PedalDecoder(num_pedals=num_pedals, threshold=thresh)
         events_df, probs, states = decoder(pred_pedal_probs)
     except Exception:
-        # Return empty results if decoding fails
         result = {
             "sustain": {"precision": 0.0, "recall": 0.0, "f1": 0.0},
             "soft": {"precision": 0.0, "recall": 0.0, "f1": 0.0},
@@ -477,61 +472,66 @@ def threshold_eval_pedals(gt_pedal_events, pred_pedal_probs, secs_per_frame,
             return {"sustain": result["sustain"], "macro_avg": result["macro_avg"]}
         return result
 
-    # Convert predicted time indices to onset times in seconds for evaluation
     if "t_idx" in events_df.columns:
         events_df["onset"] = (
             events_df["t_idx"].astype(float) * float(secs_per_frame)
             + float(shift_preds)
         )
 
-    # Evaluate each pedal separately using the available pedal channels
     pedal_names = ["sustain", "soft", "tenuto"][:num_pedals]
     results = {}
-    
+
     for pedal_idx, pedal_name in enumerate(pedal_names):
-        # Filter GT and predicted events for this pedal
         gt_subset = gt_pedal_events[gt_pedal_events["pedal_idx"] == pedal_idx] if "pedal_idx" in gt_pedal_events.columns else gt_pedal_events
         pred_subset = events_df[events_df["pedal_idx"] == pedal_idx]
-        
-        # Extract times and event types
+
         gt_onsets = gt_subset["onset"].to_numpy() if len(gt_subset) > 0 else np.array([])
         gt_types = gt_subset["event_type"].to_numpy() if len(gt_subset) > 0 else np.array([])
-        
+
         pred_onsets = pred_subset["onset"].to_numpy() if len(pred_subset) > 0 else np.array([])
         pred_types = pred_subset["event_type"].to_numpy() if len(pred_subset) > 0 else np.array([])
-        
-        # Create DataFrames for simple evaluation
-        gt_events_df = pd.DataFrame({
-            'onset': gt_onsets,
-            'event_type': gt_types
-        })
-        pred_events_df = pd.DataFrame({
-            'onset': pred_onsets,
-            'event_type': pred_types
-        })
-        
-        # Evaluate using simple pedal evaluation
+
+        gt_events_df = pd.DataFrame({'onset': gt_onsets, 'event_type': gt_types})
+        pred_events_df = pd.DataFrame({'onset': pred_onsets, 'event_type': pred_types})
+
+        def _score_for_event_type(event_type):
+            gt_filtered = gt_events_df[gt_events_df['event_type'] == event_type]
+            pred_filtered = pred_events_df[pred_events_df['event_type'] == event_type]
+            if len(gt_filtered) == 0 and len(pred_filtered) == 0:
+                return 1.0, 1.0, 1.0
+            if len(gt_filtered) == 0:
+                return 0.0, 1.0, 0.0
+            if len(pred_filtered) == 0:
+                return 0.0, 0.0, 0.0
+            return eval_sus_pedal_simple(gt_filtered, pred_filtered, tol_secs=tol_secs)
+
+        onset_prec, onset_rec, onset_f1 = _score_for_event_type('onset')
+        offset_prec, offset_rec, offset_f1 = _score_for_event_type('offset')
+
         if len(gt_events_df) == 0 and len(pred_events_df) == 0:
-            # No GT and no predictions - perfect score
             prec, rec, f1 = 1.0, 1.0, 1.0
         elif len(gt_events_df) == 0:
-            # No GT but some predictions - poor precision
             prec, rec, f1 = 0.0, 1.0, 0.0
         elif len(pred_events_df) == 0:
-            # GT events but no predictions - poor recall
             prec, rec, f1 = 0.0, 0.0, 0.0
         else:
-            prec, rec, f1 = eval_sus_pedal_simple(
-                gt_events_df, pred_events_df,
-                tol_secs=tol_secs
-            )
-        
-        results[pedal_name] = {"precision": prec, "recall": rec, "f1": f1}
-    
-    # Also compute macro-average across pedals
+            prec, rec, f1 = eval_sus_pedal_simple(gt_events_df, pred_events_df, tol_secs=tol_secs)
+
+        results[pedal_name] = {
+            "precision": prec,
+            "recall": rec,
+            "f1": f1,
+            "onset_precision": onset_prec,
+            "onset_recall": onset_rec,
+            "onset_f1": onset_f1,
+            "offset_precision": offset_prec,
+            "offset_recall": offset_rec,
+            "offset_f1": offset_f1,
+        }
+
     avg_prec = np.mean([v["precision"] for v in results.values()])
     avg_rec = np.mean([v["recall"] for v in results.values()])
     avg_f1 = np.mean([v["f1"] for v in results.values()])
     results["macro_avg"] = {"precision": avg_prec, "recall": avg_rec, "f1": avg_f1}
-    
+
     return results

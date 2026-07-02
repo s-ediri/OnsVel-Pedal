@@ -3,22 +3,20 @@
 
 
 """
-Assuming a pretrained model to detect piano key onsets and velocities, this
-script uses the MAESTRO validation split to find its optimal detection
-threshold and delay via a grid search, and then the MAESTRO test split to
-compute the evaluation results (in the form of precision, recall and F1) for
-the corresponding optimal threshold and delay. Specifically:
+Assuming a pretrained model for pedal-aware piano transcription, this script uses
+the MAESTRO validation split to find its optimal detection thresholds and delay
+via a grid search, and then the MAESTRO test split to compute evaluation results
+for onsets, velocities, and sustain-pedal events. Specifically:
 
 1. loads cross-validation and test datasets
-2. loads ground truth annotations and convert into event format
-3. instantiates model and decoder to predict logmels into event format
+2. loads ground truth annotations and converts them into event format
+3. instantiates the model and decoder to predict log-mel features into musical events
 4. performs model inference on the full XV dataset
-5. performs grid search XV eval to find best threshold and delay hyperpars
-6. performs full test evaluation with XV-optimal threshold and delay
+5. performs grid search XV eval to find the best thresholds and delay hyperparameters
+6. performs full test evaluation with XV-optimal thresholds and delay
 
-Note that, to minimize the chances of overfitting, the optimal hyperparameters
-are being searched on the cross-validation set. Then, they are kept constant
-and the test evaluation is performed only once.
+The workflow is designed to evaluate the project’s unique sustain-pedal prediction
+capabilities alongside standard onset and velocity metrics.
 """
 
 

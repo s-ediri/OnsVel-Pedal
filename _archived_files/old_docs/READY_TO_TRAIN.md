@@ -28,8 +28,8 @@
 ## Ready to Launch Training!
 
 ```bash
-cd e:\FYP\iamusica_training
-python train_with_optimizations.py
+cd D:\FYP\OnV+Pedal
+python 1_train_onsets_velocities.py
 ```
 
 ### What Will Happen
