@@ -15,17 +15,15 @@ including:
 
 
 import os
-#
 import numpy as np
 import pandas as pd
-from concurrent.futures import ProcessPoolExecutor
-#
-from .data.key_model import KeyboardStateMachine
-from .data.midi import SingletrackMidiParser, MaestroMidiParser
-from .data.midi import MidiToPianoRoll
+import torch
 from mir_eval.transcription import precision_recall_f1_overlap as prf1o
 from mir_eval.transcription_velocity import precision_recall_f1_overlap \
     as prf1o_v
+from .data.key_model import KeyboardStateMachine
+from .data.midi import MidiToPianoRoll, MaestroMidiParser, SingletrackMidiParser
+from .inference import PedalDecoder
 
 
 # ##############################################################################
@@ -57,8 +55,7 @@ class GtLoaderMaps:
 
     @classmethod
     def get_midi_eventdata(cls, abspath):
-        """
-        """
+        """Get MIDI event data from a file."""
         # load and check midi
         mid = cls.PARSER.load_midi(abspath)
         msgs, meta_msgs = cls.PARSER.parse_midi(mid)
@@ -75,16 +72,14 @@ class GtLoaderMaps:
         return (key_events, sus_states, ten_states, soft_states, largest_ts)
 
     def __init__(self, dataset, meta_dataset):
-        """
-        """
+        """Initialize GtLoaderMaps."""
         self.dataset, self.meta_dataset = dataset, meta_dataset
         self.midi_abspaths = [self.get_metadata_path(md, meta_dataset)
                               for _, _, md in dataset]
         # Disable ProcessPoolExecutor to avoid memory issues on Windows
         # Use sequential processing instead
         midi_eventdata = [self.get_midi_eventdata(ap) for ap in self.midi_abspaths]
-        self.midi_eventdata = {ap: data for ap, data
-                               in zip(self.midi_abspaths, midi_eventdata)}
+        self.midi_eventdata = dict(zip(self.midi_abspaths, midi_eventdata))
         # all onset-offset intervals must be >0, so add epsilon if needed:
         for (key_evts, _, _, _, _) in self.midi_eventdata.values():
             diffs = key_evts["offset"] - key_evts["onset"]
@@ -127,118 +122,92 @@ class GtLoaderMaestro(GtLoaderMaps):
         :returns: DataFrame with sustain pedal onset/offset events
         """
         md_path = self.get_metadata_path(data_md, self.meta_dataset)
-        key_events, sus_states, ten_states, soft_states, largest_ts = self.midi_eventdata[md_path]
-        
+        _, sus_states, _, _, _ = self.midi_eventdata[md_path]
+
         # Convert sustain pedal states to events
-        sus_pedal_events = sus_states_to_events(sus_states, secs_per_frame)
+        sus_pedal_events = sus_states_to_events(sus_states)
         return sus_pedal_events
 
 
 # ##############################################################################
 # # SUSTAIN PEDAL EVENT CONVERSION
 # ##############################################################################
-def sus_states_to_events(sus_states_df, secs_per_frame):
+def sus_states_to_events(sus_states_df):
     """
     Convert sustain pedal state DataFrame to onset/offset events.
-    
-    :param sus_states_df: DataFrame with columns ['ts', 'val'] from MIDI parsing
-    :param secs_per_frame: Time per frame in seconds
-    :returns: DataFrame with columns ['onset', 'event_type'] where event_type is 'onset' or 'offset'
+
+    :param sus_states_df: DataFrame with columns ["ts", "val"] from MIDI parsing
+    :returns: DataFrame with columns ["onset", "event_type"] where event_type is "onset" or "offset"
     """
     if sus_states_df.empty:
-        return pd.DataFrame(columns=['onset', 'event_type'])
-    
+        return pd.DataFrame(columns=["onset", "event_type"])
+
     events = []
     prev_state = 0
     thresholds_to_try = [7, 1, 0]  # Try progressively lower thresholds
-    
+
     for threshold in thresholds_to_try:
         events = []
         prev_state = 0
         for _, row in sus_states_df.iterrows():
-            current_state = 1 if row['val'] > threshold else 0
-            
+            current_state = 1 if row["val"] > threshold else 0
+
             # Detect state transitions
             if prev_state == 0 and current_state == 1:
-                events.append({'onset': row['ts'], 'event_type': 'onset'})
+                events.append({"onset": row["ts"], "event_type": "onset"})
             elif prev_state == 1 and current_state == 0:
-                events.append({'onset': row['ts'], 'event_type': 'offset'})
-            
+                events.append({"onset": row["ts"], "event_type": "offset"})
+
             prev_state = current_state
         if len(events) > 0:
             break
-    
+
     return pd.DataFrame(events)
 
 
 # ##############################################################################
 # # EVENT-BASED EVALUATION
 # ##############################################################################
-def eval_note_events(gt_onsets, gt_keys,
-                     pred_onsets, pred_keys,
-                     gt_vels=None, pred_vels=None,
-                     tol_secs=0.05, pitch_tolerance=0.1,
-                     velocity_tolerance=0.1,
-                     pred_key_shift=0, pred_onset_mul=1.0,
-                     pred_shift=0):
-    """
-    Given sets of ground truth and predicted note events (with their onsets,
-    keys, and optionally velocities), as well as the potential shift of onset
-    keys and scale+shift of onset times, computes+returns the precision, recall
-    and F1 score. Predictions are considered correct if they are within given
-    onset time and pitch tolerances (and also velocity if given). Check the
-    ``precision_recall_f1_overlap`` functions from ``mir_eval.transcription``
-    and ``mir_eval.transcription_velocity`` for more details.
+def _prepare_data(gt_onsets, pred_onsets, pred_keys, pred_key_shift,
+                  pred_onset_mul, pred_shift):
+    if pred_key_shift != 0:
+        pred_keys = pred_keys + pred_key_shift
+    if pred_onset_mul != 1.0:
+        pred_onsets = pred_onsets * pred_onset_mul
+    if pred_shift != 0:
+        pred_onsets = pred_onsets + pred_shift
+    gt_offsets = gt_onsets + 1
+    pred_offsets = pred_onsets + 1
+    return pred_keys, pred_onsets, gt_offsets, pred_offsets
 
-    :param gt_onsets: Numpy 1D array with onset timestamps in seconds.
-    :param gt_keys: Numpy 1D array with same shape as gt_onsets designing the
-      corresponding keys.
-    :param pred_onsets: Predicted onsets, they can be of different length
-      than the ground truth but needs to be a numpy array.
-    :param pred_keys: see gt_keys
-    :param gt_vels: Numpy 1D array with GT velocities (usually MIDI 0-127, but
-      will be rescaled to 0-1 during evaluation).
-    :param pred_vels: Numpy 1D array with predicted velocities. During
-      evaluation, it will be scaled+shifted to the gt_vels, so scale and shift
-      are not important.
-    :param velocity_tolerance: Once ``pred_vels`` are scaled+shifted to best
-      fit the GT, a prediction is considered true if within this tolerance.
-    :param tol_secs: Tolerance for considering a true prediction, in seconds
-    :param pred_onset_mul: Given pred_onsets will be multiplied by this
-    :param pred_shift: **After** onsets are multiplied by ``pred_onset_mul``,
-      they will be added this shift.
-    """
-    if len(pred_onsets) == 0:
-        # if model didn't predict any onsets gather 0 for all metrics
-        prec, rec, f1 = 0, 0, 0
+def _calculate_scores(gt_onsets, gt_offsets, gt_keys, gt_vels, pred_onsets, pred_offsets, pred_keys, pred_vels, tol_secs, pitch_tolerance, velocity_tolerance):
+    if (gt_vels is not None) and (pred_vels is not None):
+        prec, rec, f1, _ = prf1o_v(
+            np.stack((gt_onsets, gt_offsets)).T, gt_keys, gt_vels,
+            np.stack((pred_onsets, pred_offsets)).T, pred_keys, pred_vels,
+            onset_tolerance=tol_secs, pitch_tolerance=pitch_tolerance,
+            velocity_tolerance=velocity_tolerance,
+            offset_ratio=None,
+            offset_min_tolerance=tol_secs)
     else:
-        #
-        if pred_key_shift != 0:
-            pred_keys = pred_keys + pred_key_shift
-        if pred_onset_mul != 1.0:
-            pred_onsets = pred_onsets * pred_onset_mul
-        if pred_shift != 0:
-            pred_onsets = pred_onsets + pred_shift
-        # mir_eval code needs offsets, even when ignored
-        gt_offsets = gt_onsets + 1
-        pred_offsets = pred_onsets + 1
-        # eval predictions using the mir_eval lib
-        if (gt_vels is not None) and (pred_vels is not None):
-            prec, rec, f1, _ = prf1o_v(
-                np.stack((gt_onsets, gt_offsets)).T, gt_keys, gt_vels,
-                np.stack((pred_onsets, pred_offsets)).T, pred_keys, pred_vels,
-                onset_tolerance=tol_secs, pitch_tolerance=pitch_tolerance,
-                velocity_tolerance=velocity_tolerance,
-                offset_ratio=None,  # ignore offsets
-                offset_min_tolerance=tol_secs)
-        else:
-            prec, rec, f1, _ = prf1o(
-                np.stack((gt_onsets, gt_offsets)).T, gt_keys,
-                np.stack((pred_onsets, pred_offsets)).T, pred_keys,
-                onset_tolerance=tol_secs, pitch_tolerance=pitch_tolerance,
-                offset_ratio=None,  # ignore offsets
-                offset_min_tolerance=tol_secs)
-    #
+        prec, rec, f1, _ = prf1o(
+            np.stack((gt_onsets, gt_offsets)).T, gt_keys,
+            np.stack((pred_onsets, pred_offsets)).T, pred_keys,
+            onset_tolerance=tol_secs, pitch_tolerance=pitch_tolerance,
+            offset_ratio=None,
+            offset_min_tolerance=tol_secs)
+    return prec, rec, f1
+
+def eval_note_events(gt_onsets, gt_keys, pred_onsets, pred_keys, gt_vels=None, pred_vels=None, tol_secs=0.05, pitch_tolerance=0.1, velocity_tolerance=0.1, pred_key_shift=0, pred_onset_mul=1.0, pred_shift=0):
+    if len(gt_onsets) == 0:
+        return (1, 1, 1) if len(pred_onsets) == 0 else (0, 1, 0)
+    if len(pred_onsets) == 0:
+        return 0, 0, 0
+
+    pred_keys, pred_onsets, gt_offsets, pred_offsets = _prepare_data(
+        gt_onsets, pred_onsets, pred_keys, pred_key_shift,
+        pred_onset_mul, pred_shift)
+    prec, rec, f1 = _calculate_scores(gt_onsets, gt_offsets, gt_keys, gt_vels, pred_onsets, pred_offsets, pred_keys, pred_vels, tol_secs, pitch_tolerance, velocity_tolerance)
     return prec, rec, f1
 
 
@@ -295,53 +264,51 @@ def eval_sus_pedal_simple(gt_events_df, pred_events_df, tol_secs=0.05):
     :param tol_secs: Time tolerance in seconds
     :returns: (precision, recall, f1) for sustain pedal events
     """
-    if len(gt_events_df) == 0:
-        if len(pred_events_df) == 0:
+    if not gt_events_df.empty:
+        if pred_events_df.empty:
+            return 0.0, 0.0, 0.0
+    else:
+        if pred_events_df.empty:
             return 1.0, 1.0, 1.0
-        else:
-            return 0.0, 1.0, 0.0
-    
-    if len(pred_events_df) == 0:
-        return 0.0, 0.0, 0.0
-    
+        return 0.0, 1.0, 0.0
+
     tp = 0  # True positives
-    fp = 0  # False positives  
-    fn = 0  # False negatives
-    
+    fp = 0  # False positives
+
     matched_gt = set()
-    
+
     for _, pred_row in pred_events_df.iterrows():
-        pred_time = pred_row['onset']
-        pred_type = pred_row['event_type']
-        
+        pred_time = pred_row["onset"]
+        pred_type = pred_row["event_type"]
+
         # Find matching GT event
         best_match = None
         best_dist = tol_secs
-        
+
         for gt_idx, gt_row in gt_events_df.iterrows():
             if gt_idx in matched_gt:
                 continue
-            
-            if gt_row['event_type'] != pred_type:
+
+            if gt_row["event_type"] != pred_type:
                 continue
-                
-            dist = abs(pred_time - gt_row['onset'])
+
+            dist = abs(pred_time - gt_row["onset"])
             if dist < best_dist:
                 best_match = gt_idx
                 best_dist = dist
-        
+
         if best_match is not None:
             tp += 1
             matched_gt.add(best_match)
         else:
             fp += 1
-    
+
     fn = len(gt_events_df) - len(matched_gt)
-    
+
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-    
+
     return precision, recall, f1
 
 
@@ -364,51 +331,49 @@ def eval_pedal_events(gt_onsets, gt_pedals, pred_onsets, pred_pedals,
     :returns: Tuple (precision, recall, f1_score)
     """
     # If no events, return perfect score for empty predictions, 0 otherwise
-    if len(gt_onsets) == 0:
-        if len(pred_onsets) == 0:
+    if gt_onsets.size > 0:
+        if pred_onsets.size == 0:
+            return 0.0, 0.0, 0.0
+    else:
+        if pred_onsets.size == 0:
             return 1.0, 1.0, 1.0
-        else:
-            return 0.0, 1.0, 0.0
-    
-    if len(pred_onsets) == 0:
-        return 0.0, 0.0, 0.0
-    
+        return 0.0, 1.0, 0.0
+
     # Match predictions to ground truth within tolerance window
     tp = 0  # True positives
     fp = 0  # False positives
-    fn = 0  # False negatives
-    
+
     matched_gt = set()
-    
+
     for pred_t, pred_state in zip(pred_onsets, pred_pedals):
         # Find closest GT event within tolerance
         best_match = None
         best_dist = tol_secs
-        
+
         for gt_idx, (gt_t, gt_state) in enumerate(zip(gt_onsets, gt_pedals)):
             if gt_idx in matched_gt:
                 continue
-            
+
             dist = abs(pred_t - gt_t)
             if dist < best_dist and pred_state == gt_state:
                 best_match = gt_idx
                 best_dist = dist
-        
+
         if best_match is not None:
             tp += 1
             matched_gt.add(best_match)
         else:
             fp += 1
-    
+
     # Remaining unmatched GTs are false negatives
     fn = len(gt_onsets) - len(matched_gt)
-    
+
     # Compute metrics
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * (precision * recall) / (precision + recall) \
         if (precision + recall) > 0 else 0.0
-    
+
     return precision, recall, f1
 
 
@@ -423,23 +388,7 @@ def _score_event_type(gt_events_df, pred_events_df, tol_secs):
                                   tol_secs=tol_secs)
 
 
-def threshold_eval_pedals(gt_pedal_events, pred_pedal_probs, secs_per_frame,
-                          thresh=0.5, shift_preds=0, tol_secs=0.05):
-    """
-    Evaluate pedal event detection with thresholding.
-
-    :param gt_pedal_events: Ground truth pedal events dataframe with columns
-      [onset, pedal_idx, event_type]
-    :param pred_pedal_probs: Predicted pedal probabilities (b, num_pedals, t)
-    :param secs_per_frame: Conversion factor from frame index to seconds
-    :param thresh: Probability threshold for pedal activation
-    :param shift_preds: Time shift to apply to predictions (seconds)
-    :param tol_secs: Time tolerance for matching
-    :returns: Dictionary with per-pedal precision, recall, f1 scores
-    """
-    from .inference import PedalDecoder
-    import torch
-
+def _prepare_pedal_data(pred_pedal_probs):
     if not isinstance(pred_pedal_probs, torch.Tensor):
         pred_pedal_probs = torch.tensor(pred_pedal_probs)
 
@@ -458,38 +407,33 @@ def threshold_eval_pedals(gt_pedal_events, pred_pedal_probs, secs_per_frame,
         pred_pedal_probs = pred_pedal_probs.view(1, 1, 1)
 
     if pred_pedal_probs.dim() != 3:
-        raise ValueError(
-            f"Unexpected pred_pedal_probs shape after normalization: {pred_pedal_probs.shape}"
-        )
+        raise ValueError(f"Unexpected pred_pedal_probs shape after normalization: {pred_pedal_probs.shape}")
 
+    return pred_pedal_probs
+
+def _decode_pedal_predictions(pred_pedal_probs, thresh):
     num_pedals = pred_pedal_probs.shape[1]
     if num_pedals < 1:
-        return {"sustain": {"precision": 0.0, "recall": 0.0, "f1": 0.0},
-                "soft": {"precision": 0.0, "recall": 0.0, "f1": 0.0},
-                "tenuto": {"precision": 0.0, "recall": 0.0, "f1": 0.0},
-                "macro_avg": {"precision": 0.0, "recall": 0.0, "f1": 0.0}}
+        return None
 
     try:
         decoder = PedalDecoder(num_pedals=num_pedals, threshold=thresh)
-        events_df, probs, states = decoder(pred_pedal_probs)
-    except Exception:
-        result = {
-            "sustain": {"precision": 0.0, "recall": 0.0, "f1": 0.0},
-            "soft": {"precision": 0.0, "recall": 0.0, "f1": 0.0},
-            "tenuto": {"precision": 0.0, "recall": 0.0, "f1": 0.0},
-            "macro_avg": {"precision": 0.0, "recall": 0.0, "f1": 0.0}
-        }
-        if num_pedals == 1:
-            return {"sustain": result["sustain"], "macro_avg": result["macro_avg"]}
-        return result
+        events_df, _, _ = decoder(pred_pedal_probs)
+        return events_df
+    except ValueError:
+        return None
+
+def threshold_eval_pedals(gt_pedal_events, pred_pedal_probs, secs_per_frame, thresh=0.5, shift_preds=0, tol_secs=0.05):
+    pred_pedal_probs = _prepare_pedal_data(pred_pedal_probs)
+    events_df = _decode_pedal_predictions(pred_pedal_probs, thresh)
+
+    if events_df is None:
+        return {"sustain": {"precision": 0.0, "recall": 0.0, "f1": 0.0}, "soft": {"precision": 0.0, "recall": 0.0, "f1": 0.0}, "tenuto": {"precision": 0.0, "recall": 0.0, "f1": 0.0}, "macro_avg": {"precision": 0.0, "recall": 0.0, "f1": 0.0}}
 
     if "t_idx" in events_df.columns:
-        events_df["onset"] = (
-            events_df["t_idx"].astype(float) * float(secs_per_frame)
-            + float(shift_preds)
-        )
+        events_df["onset"] = (events_df["t_idx"].astype(float) * float(secs_per_frame)) + float(shift_preds)
 
-    pedal_names = ["sustain", "soft", "tenuto"][:num_pedals]
+    pedal_names = ["sustain", "soft", "tenuto"][:pred_pedal_probs.shape[1]]
     results = {}
 
     for pedal_idx, pedal_name in enumerate(pedal_names):
@@ -502,32 +446,15 @@ def threshold_eval_pedals(gt_pedal_events, pred_pedal_probs, secs_per_frame,
         pred_onsets = pred_subset["onset"].to_numpy() if len(pred_subset) > 0 else np.array([])
         pred_types = pred_subset["event_type"].to_numpy() if len(pred_subset) > 0 else np.array([])
 
-        gt_events_df = pd.DataFrame({'onset': gt_onsets, 'event_type': gt_types})
-        pred_events_df = pd.DataFrame({'onset': pred_onsets, 'event_type': pred_types})
+        gt_events_df = pd.DataFrame({"onset": gt_onsets, "event_type": gt_types})
+        pred_events_df = pd.DataFrame({"onset": pred_onsets, "event_type": pred_types})
 
-        onset_prec, onset_rec, onset_f1 = _score_event_type(
-            gt_events_df[gt_events_df['event_type'] == 'onset'],
-            pred_events_df[pred_events_df['event_type'] == 'onset'],
-            tol_secs)
-        offset_prec, offset_rec, offset_f1 = _score_event_type(
-            gt_events_df[gt_events_df['event_type'] == 'offset'],
-            pred_events_df[pred_events_df['event_type'] == 'offset'],
-            tol_secs)
+        onset_prec, onset_rec, onset_f1 = _score_event_type(gt_events_df[gt_events_df["event_type"] == "onset"], pred_events_df[pred_events_df["event_type"] == "onset"], tol_secs)
+        offset_prec, offset_rec, offset_f1 = _score_event_type(gt_events_df[gt_events_df["event_type"] == "offset"], pred_events_df[pred_events_df["event_type"] == "offset"], tol_secs)
 
-        prec, rec, f1 = _score_event_type(gt_events_df, pred_events_df,
-                                          tol_secs)
+        prec, rec, f1 = _score_event_type(gt_events_df, pred_events_df, tol_secs)
 
-        results[pedal_name] = {
-            "precision": prec,
-            "recall": rec,
-            "f1": f1,
-            "onset_precision": onset_prec,
-            "onset_recall": onset_rec,
-            "onset_f1": onset_f1,
-            "offset_precision": offset_prec,
-            "offset_recall": offset_rec,
-            "offset_f1": offset_f1,
-        }
+        results[pedal_name] = {"precision": prec, "recall": rec, "f1": f1, "onset_precision": onset_prec, "onset_recall": onset_rec, "onset_f1": onset_f1, "offset_precision": offset_prec, "offset_recall": offset_rec, "offset_f1": offset_f1}
 
     avg_prec = np.mean([v["precision"] for v in results.values()])
     avg_rec = np.mean([v["recall"] for v in results.values()])

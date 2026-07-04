@@ -17,7 +17,7 @@ from typing import Optional, List
 from omegaconf import OmegaConf, MISSING
 import pandas as pd
 #
-from ov_piano.logging import ColorLogger
+from ov_piano.custom_logging import ColorLogger
 
 
 # ##############################################################################

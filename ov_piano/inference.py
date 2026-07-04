@@ -34,7 +34,7 @@ def strided_inference(model, x, chunk_size=10000, chunk_overlap=0):
     :returns: List of tensors of shape ``(b, h_i, t)`` on CPU.
     """
     # sanity checks
-    assert chunk_overlap >= 2, "overlap must be >=2!"
+    assert chunk_overlap >= 0, "overlap must be non-negative!"
     assert (chunk_overlap % 2) == 0, "chunk_overlap must be even!"
     half_overlap = chunk_overlap // 2
     #
@@ -98,8 +98,8 @@ def strided_inference(model, x, chunk_size=10000, chunk_overlap=0):
     # gather concatenated results
     t_results = []
     for result in map(list, zip(*results)):
-        # If we have 1 chunk, return as-is, no cuts needed
-        if len(result) > 1:
+        # If we have 1 chunk or no overlap, return chunks as-is.
+        if len(result) > 1 and half_overlap > 0:
             result[0] = result[0][..., :-half_overlap]
             result[-1] = result[-1][..., half_overlap:]
             for i in range(1, len(result) - 1):

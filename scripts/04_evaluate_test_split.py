@@ -22,7 +22,7 @@ from omegaconf import OmegaConf
 
 from ov_piano import PIANO_MIDI_RANGE, HDF5PathManager
 from ov_piano.utils import load_model
-from ov_piano.logging import ColorLogger
+from ov_piano.custom_logging import ColorLogger
 from ov_piano.data.maestro import MetaMAESTROv1, MetaMAESTROv2, MetaMAESTROv3
 from ov_piano.data.maestro import MelMaestro
 from ov_piano.models.ov import OnsetsAndVelocities

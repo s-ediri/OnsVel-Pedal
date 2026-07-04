@@ -13,10 +13,10 @@ conda activate onsvel
 ## Step 2: Run Evaluation
 ```bash
 # Using the default checkpoint (latest in out/model_snapshots/)
-python 03_evaluate_pedal_model.py
+python scripts/03_evaluate_pedal_model.py
 
 # Or specify a specific checkpoint:
-python 03_evaluate_pedal_model.py SNAPSHOT_INPATH="out/model_snapshots/YOUR_MODEL.torch"
+python scripts/03_evaluate_pedal_model.py SNAPSHOT_INPATH="out/model_snapshots/YOUR_MODEL.torch"
 ```
 
 ## Step 3: Check Results
@@ -61,7 +61,7 @@ ls out/model_snapshots/
 ### Out of Memory (OOM)
 **Solution:** Reduce chunk size in evaluation:
 ```bash
-python 03_evaluate_pedal_model.py INFERENCE_CHUNK_SIZE=60.0
+python scripts/03_evaluate_pedal_model.py INFERENCE_CHUNK_SIZE=60.0
 ```
 
 ## Configuration Options
@@ -70,16 +70,16 @@ You can override any configuration parameter via command line:
 
 ```bash
 # Use smaller chunks (for limited memory)
-python 03_evaluate_pedal_model.py INFERENCE_CHUNK_SIZE=100
+python scripts/03_evaluate_pedal_model.py INFERENCE_CHUNK_SIZE=100
 
 # Test fewer thresholds (faster evaluation)
-python 03_evaluate_pedal_model.py SEARCH_THRESHOLDS="[0.7, 0.75, 0.8]"
+python scripts/03_evaluate_pedal_model.py SEARCH_THRESHOLDS="[0.7, 0.75, 0.8]"
 
 # Use CPU instead of GPU
-python 03_evaluate_pedal_model.py DEVICE="cpu"
+python scripts/03_evaluate_pedal_model.py DEVICE="cpu"
 
 # Process only every Nth validation file (faster)
-python 03_evaluate_pedal_model.py XV_TAKE_ONE_EVERY=10
+python scripts/03_evaluate_pedal_model.py XV_TAKE_ONE_EVERY=10
 ```
 
 ## Alternative Evaluation Scripts
@@ -138,17 +138,17 @@ Your model (with pedal support) may have slightly different metrics depending on
 
 1. **Analyze training logs:**
    ```bash
-   python 05_analyze_training_logs.py LOG_PATH="out/txt_logs/YOUR_LOG.json"
+python scripts/05_analyze_training_logs.py LOG_PATH="out/txt_logs/YOUR_LOG.json"
    ```
 
 2. **Generate visualization plots:**
    ```bash
-   python 06_visualize_pedal_predictions.py SNAPSHOT_INPATH="out/model_snapshots/YOUR_MODEL.torch"
+python scripts/06_visualize_pedal_predictions.py SNAPSHOT_INPATH="out/model_snapshots/YOUR_MODEL.torch"
    ```
 
 3. **Continue training:**
    ```bash
-   python 02_train_pedal_model.py
+   python scripts/02_train_pedal_model.py
    # Will auto-resume from latest checkpoint
    ```
 

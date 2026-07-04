@@ -18,7 +18,7 @@ from torchaudio.transforms import MelSpectrogram, AmplitudeToDB
 import numpy as np
 import h5py
 #
-from .logging import make_timestamp
+from .custom_logging import make_timestamp
 
 
 # ##############################################################################
@@ -137,6 +137,30 @@ class IncrementalHDF5:
 # ##############################################################################
 # # AUDIO PREPROCESSING
 # ##############################################################################
+from typing import Optional
+
+def torch_resample_audio(wave: torch.Tensor, sr_in: int, target_sr: int, mono: bool = True, device: str = "cpu") -> torch.Tensor:
+    """
+    Resamples a wave tensor.
+    :param wave: The input wave tensor
+    :param sr_in: The input sample rate
+    :param target_sr: The target sample rate
+    :param mono: If true, returned wavfile will be averaged down to mono.
+    :param device: Returned wavfile will be on the specified device.
+    """
+    wave = wave.to(device)
+
+    # Convert to mono if requested and needed
+    if mono and wave.dim() > 1 and wave.shape[0] > 1:
+        wave = wave.mean(dim=0, keepdim=True)
+
+    # Resample if necessary
+    if sr_in != target_sr:
+        resampler = torchaudio.transforms.Resample(sr_in, target_sr).to(device)
+        wave = resampler(wave)
+    
+    return wave
+
 def torch_load_resample_audio(path, target_sr=16000, mono=True,
                               device="cpu"):
     """
@@ -148,11 +172,7 @@ def torch_load_resample_audio(path, target_sr=16000, mono=True,
     :param device: Returned wavfile will be on the specified device.
     """
     wave, sr_in = torchaudio.load(path)
-    resampler = torchaudio.transforms.Resample(sr_in, target_sr).to(device)
-    if mono:
-        wave = wave.mean(dim=0)
-    wave = resampler(wave.to(device))
-    return wave
+    return torch_resample_audio(wave, sr_in, target_sr, mono, device)
 
 
 class TorchWavToLogmel(torch.nn.Module):
@@ -189,6 +209,11 @@ class TorchWavToLogmel(torch.nn.Module):
         """
         mel = self.melspec(wav_arr)
         log_mel = self.to_db(mel)
+
+        # If input was batched but batch size was 1, squeeze the batch dim
+        if log_mel.dim() == 3 and log_mel.shape[0] == 1:
+            log_mel = log_mel.squeeze(0)
+
         return log_mel
 
 

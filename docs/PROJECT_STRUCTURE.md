@@ -4,17 +4,18 @@
 
 ```
 OnV+Pedal/
-├── 📄 Core Scripts (6 files)
+├── scripts/ - Runnable entry points
 │   ├── 00_prepare_maestro_hdf5.py    # Preprocess MAESTRO dataset to HDF5
 │   ├── 01_prepare_maps_hdf5.py       # Preprocess MAPS dataset to HDF5
 │   ├── 02_train_pedal_model.py       # Training script (with pedal support)
-│   ├── 03_evaluate_pedal_model.py    # Evaluation script (FIXED)
+│   ├── 03_evaluate_pedal_model.py    # Evaluation script
+│   ├── 04_evaluate_test_split.py     # Test split evaluation
 │   ├── 05_analyze_training_logs.py   # Training log analysis
 │   └── 06_visualize_pedal_predictions.py # Generate visualization plots
 │
 ├── 📁 ov_piano/ - Core Module
 │   ├── __init__.py
-│   ├── logging.py                    # Logging utilities
+│   ├── custom_logging.py             # Logging utilities
 │   ├── utils.py                      # Model loading, training utils
 │   ├── optimizers.py                 # AdamWR optimizer
 │   ├── inference.py                  # Strided inference, decoders (FIXED)
@@ -30,7 +31,7 @@ OnV+Pedal/
 │       ├── ov.py                     # OnsetsAndVelocities model (FIXED)
 │       └── building_blocks.py        # Neural network components
 │
-├── 📚 Documentation (3 files)
+├── docs/ - Documentation
 │   ├── README.md                     # Pedal-focused project documentation
 │   ├── EVALUATION_FIXES_SUMMARY.md   # Comprehensive fixes & architecture
 │   └── QUICK_START_EVALUATION.md     # Quick start evaluation guide
@@ -38,22 +39,25 @@ OnV+Pedal/
 ├── 🔧 Utilities
 │   └── breakpoint.json               # Training debugging control
 │
-├── 📦 Data (not tracked)
+├── tests/                         # Pytest smoke/regression tests
+│
+├── web_app/                       # Flask transcription UI
+│
+├── assets/                        # Static project assets/checkpoints
+│   └── OnsetsAndVelocities_*.torch # Reference pretrained checkpoint
+│
+├── Data (not tracked)
 │   ├── datasets/
 │   │   ├── maestro/
 │   │   │   └── maestro-v3.0.0/
 │   │   ├── MAESTROv3_logmel_*.h5
 │   │   └── MAESTROv3_roll_*.h5
 │
-├── 💾 Output (not tracked)
-│   └── out/
-│       ├── model_snapshots/          # Trained model checkpoints
-│       └── txt_logs/                 # Training & evaluation logs
+├── out/                           # Generated runs (not tracked)
+│   ├── model_snapshots/            # Trained model checkpoints
+│   └── txt_logs/                   # Training & evaluation logs
 │
-└── 🗄️ _archived_files/ (35+ files moved here)
-    ├── old_docs/                     # 11 superseded documentation files
-    ├── debug_scripts/                # 13 temporary test/debug scripts
-    └── scripts/                      # Old analysis scripts
+└── uploads/                       # Uploaded model/audio artifacts (not tracked)
 ```
 
 ---
@@ -63,23 +67,35 @@ OnV+Pedal/
 ### Training
 ```bash
 conda activate onsvel
-python 02_train_pedal_model.py
+python scripts/02_train_pedal_model.py
 ```
 
 ### Evaluation
 ```bash
-python 03_evaluate_pedal_model.py
+python scripts/03_evaluate_pedal_model.py
 ```
 
 ### Log Analysis
 ```bash
-python 05_analyze_training_logs.py LOG_PATH="out/txt_logs/YOUR_LOG.json"
+python scripts/05_analyze_training_logs.py LOG_PATH="out/txt_logs/YOUR_LOG.json"
 ```
 
 ### Visualization
 ```bash
-python 06_visualize_pedal_predictions.py SNAPSHOT_INPATH="out/model_snapshots/YOUR_MODEL.torch"
+python scripts/06_visualize_pedal_predictions.py SNAPSHOT_INPATH="out/model_snapshots/YOUR_MODEL.torch"
 ```
+
+---
+
+## Structure Decision
+
+Git history shows three main layouts:
+
+1. **Initial upstream layout (`c27f042`)**: root scripts plus `iamusica_ml/` package.
+2. **Refactored package layout (`91be78d`)**: root scripts plus renamed `ov_piano/` package.
+3. **Pedal-focused cleanup (`98a2b56` → `HEAD`)**: `ov_piano/` core, many root scripts/docs/debug artifacts, and archived temporary files.
+
+The current foldered layout is the best direction for this repository: it keeps reusable package code in `ov_piano/`, command-line workflows in `scripts/`, documentation in `docs/`, regression tests in `tests/`, and the Flask UI in `web_app/`. This is easier to navigate than the historical root-script layouts while preserving the established `ov_piano` domain boundary.
 
 ---
 
@@ -118,7 +134,7 @@ python 06_visualize_pedal_predictions.py SNAPSHOT_INPATH="out/model_snapshots/YO
 **Miscellaneous:**
 - cleaned_attendance.csv (unrelated)
 - train.bat (redundant)
-- scripts/ directory
+- root-level script clutter (current entry points live in `scripts/`)
 
 ---
 
@@ -134,14 +150,14 @@ python 06_visualize_pedal_predictions.py SNAPSHOT_INPATH="out/model_snapshots/YO
 
 ## Recovery
 
-All archived files are preserved in `_archived_files/` if you need to recover anything:
+Historical files can be recovered from Git history if needed:
 - `_archived_files/old_docs/` - Old documentation
 - `_archived_files/debug_scripts/` - Test/debug scripts
 - `_archived_files/scripts/` - Old analysis scripts
 
 To restore a file:
 ```bash
-cp _archived_files/debug_scripts/FILENAME.py .
+git checkout <commit> -- path/to/file
 ```
 
 ---

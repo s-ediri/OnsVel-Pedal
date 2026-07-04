@@ -20,7 +20,7 @@ from matplotlib.ticker import FuncFormatter
 #
 from ov_piano import PIANO_MIDI_RANGE, HDF5PathManager
 from ov_piano.utils import load_model
-from ov_piano.logging import ColorLogger
+from ov_piano.custom_logging import ColorLogger
 from ov_piano.data.maestro import MetaMAESTROv1, MetaMAESTROv2, MetaMAESTROv3
 from ov_piano.data.maestro import MelMaestro
 from ov_piano.models.ov import OnsetsAndVelocities
@@ -171,7 +171,7 @@ class ConfDef:
     CONV1X1: List[int] = (128, 128)
     LEAKY_RELU_SLOPE: float = 0.1
     #
-    OUTPUT_DIR: Optional[str] = None  # "out/plots"
+    OUTPUT_DIR: Optional[str] = None  # "assets/plots"
     FIGSIZE: List[float] = (20, 20)
     DPI: int = 350
     MEL_CMAP: str = "bone_r"   # cividis

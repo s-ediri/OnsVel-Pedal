@@ -2,10 +2,15 @@
 datasets/*
 # if symlink
 datasets
+assets/model_snapshots/*
+assets/test_output/*
 out/*
+uploads/*
 .claude
 _archived_files
-
+.gcp
+.cline
+.clinerules
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -136,4 +141,5 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
 

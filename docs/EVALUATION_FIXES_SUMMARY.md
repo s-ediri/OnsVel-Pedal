@@ -184,7 +184,7 @@ sustain_beg, sustain_end = 2 * NUM_MIDI_VALUES, 2 * NUM_MIDI_VALUES + 1
 **Usage:**
 ```bash
 conda activate onsvel
-python 2_eval_onsets_velocities.py SNAPSHOT_INPATH="out/model_snapshots/YOUR_MODEL.torch"
+python scripts/03_evaluate_pedal_model.py SNAPSHOT_INPATH="out/model_snapshots/YOUR_MODEL.torch"
 ```
 
 **Outputs:**
@@ -283,23 +283,23 @@ if CONF.TRAIN_BS == 1:
 1. **Test the evaluation script:**
    ```bash
    conda activate onsvel
-   python 2_eval_onsets_velocities.py
+   python scripts/03_evaluate_pedal_model.py
    ```
 
 2. **Monitor training progress:**
    ```bash
-   python 1_train_onsets_velocities.py
-   # Check logs in out/txt_logs/
+   python scripts/02_train_pedal_model.py
+# Check logs in out/txt_logs/
    ```
 
 3. **Analyze results:**
    ```bash
-   python 3_analyze_logs.py LOG_PATH="out/txt_logs/YOUR_LOG.json"
+python scripts/05_analyze_training_logs.py LOG_PATH="out/txt_logs/YOUR_LOG.json"
    ```
 
 4. **Generate qualitative plots:**
    ```bash
-   python 4_qualitative_plots.py SNAPSHOT_INPATH="out/model_snapshots/YOUR_MODEL.torch"
+python scripts/06_visualize_pedal_predictions.py SNAPSHOT_INPATH="out/model_snapshots/YOUR_MODEL.torch"
    ```
 
 ---

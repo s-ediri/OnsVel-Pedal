@@ -67,7 +67,7 @@ pip install parse==1.19.0
 conda install matplotlib==3.7.1 -c conda-forge
 ```
 
-See the full [requirements](assets/requirements.txt) for a comprehensive description of the resulting environment.
+See the full [requirements](requirements.txt) for a comprehensive description of the resulting environment.
 
 
 
@@ -142,7 +142,7 @@ To train the model, we represent the audio as log-mel spectrograms and the annot
 Assuming `MAESTROv3` is in `datasets/maestro/maestro-v3.0.0`, preprocessing with the default parameters can be done by simply calling the following script:
 
 ```
-python 00_prepare_maestro_hdf5.py
+python scripts/00_prepare_maestro_hdf5.py
 ```
 
 Which will generate the `logmels` and `roll` inside the provided `OUTPUT_DIR` (default: `datasets`). Processing MAESTRO with our default parameters takes about 30min on a mid-end 16-core CPU; the piano roll HDF5 file takes about 0.5GB of space, and the log-mel file about 22.5GB.
@@ -158,14 +158,14 @@ Which will generate the `logmels` and `roll` inside the provided `OUTPUT_DIR` (d
 The script also allows to precompute former maestro versions:
 
 ```
-python 00_prepare_maestro_hdf5.py MAESTRO_VERSION=1 MAESTRO_INPATH=datasets/maestro/maestro-v1.0.0
-python 00_prepare_maestro_hdf5.py MAESTRO_VERSION=2 MAESTRO_INPATH=datasets/maestro/maestro-v2.0.0
+python scripts/00_prepare_maestro_hdf5.py MAESTRO_VERSION=1 MAESTRO_INPATH=datasets/maestro/maestro-v1.0.0
+python scripts/00_prepare_maestro_hdf5.py MAESTRO_VERSION=2 MAESTRO_INPATH=datasets/maestro/maestro-v2.0.0
 ```
 
 To precompute MAPS with default parameters (assuming it is inside `datasets/MAPS`):
 
 ```
-python 01_prepare_maps_hdf5.py
+python scripts/01_prepare_maps_hdf5.py
 ```
 
 Processing `MAPS` with the default settings takes about 20min on a 16-core CPU. The piano roll HDF5 file takes about 100MB of space, and the log-mel file about 4GB.
@@ -186,7 +186,7 @@ This repository includes support for evaluating a pretrained model checkpoint su
 
 
 ```
-python 03_evaluate_pedal_model.py SNAPSHOT_INPATH=assets/OnsetsAndVelocities_2023_03_04_09_53_53.289step=43500_f1=0.9675__0.9480.torch
+python scripts/03_evaluate_pedal_model.py SNAPSHOT_INPATH=assets/OnsetsAndVelocities_2023_03_04_09_53_53.289step=43500_f1=0.9675__0.9480.torch
 ```
 
 Yielding the following results after a few minutes:
@@ -207,7 +207,7 @@ ONS+VEL (t=0.74, s=-0.01)  0.962538    0.928580  0.945033
 For adequate training, a GPU with at least 8GB of memory is sufficient. The following command trains a model from scratch on `MAESTROv3`:
 
 ```
-python 02_train_pedal_model.py
+python scripts/02_train_pedal_model.py
 ```
 
 The following is an excerpt from the default configuration that led to the results reported in our paper:
@@ -247,7 +247,7 @@ The model is periodically cross-validated and saved under `OUTPUT_DIR`, for furt
 Since the log is a collection of JSON objects, its processing can be easily streamlined. The following script is an example, plotting the cross-validation metrics and fetching the maximum (requires `matplotlib`):
 
 ```
-python 05_analyze_training_logs.py PLOT_RANGE="[0.90, 0.97]" LOG_PATH=<...>
+python scripts/05_analyze_training_logs.py PLOT_RANGE="[0.90, 0.97]" LOG_PATH=<...>
 ```
 
 
@@ -280,5 +280,5 @@ The qualitative plot used in the [paper](https://arxiv.org/abs/2303.04485) can b
 
 
 ```
-python 06_visualize_pedal_predictions.py SNAPSHOT_INPATH=assets/OnsetsAndVelocities_2023_03_04_09_53_53.289step\=43500_f1\=0.9675__0.9480.torch OUTPUT_DIR=out
+python scripts/06_visualize_pedal_predictions.py SNAPSHOT_INPATH=assets/OnsetsAndVelocities_2023_03_04_09_53_53.289step\=43500_f1\=0.9675__0.9480.torch OUTPUT_DIR=out
 ```

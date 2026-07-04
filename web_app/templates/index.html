@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OnV+Pedal: Piano Transcription</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <script src="https://unpkg.com/tone@14.7.77/build/Tone.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/abcjs@6.2.0/dist/abcjs-basic-min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>OnV+Pedal</h1>
+            <p>A pedal-aware model for transcribing piano audio.</p>
+        </header>
+
+        <main>
+            <div class="card">
+                <div class="control-group">
+                    <label for="model-select">1. Select Model Checkpoint</label>
+                    <select id="model-select" name="model">
+                        <option value="">Loading models...</option>
+                    </select>
+                    <input type="file" id="model-file-input" style="display: none;" accept=".torch">
+                </div>
+
+                <div class="control-group">
+                    <label>2. Provide Audio</label>
+                    <div class="input-options">
+                         <div id="drop-zone" class="file-upload">
+                            <input type="file" id="audio-file" accept="audio/*" style="display: none;">
+                            <label for="audio-file" class="button">Upload File</label>
+                            <span id="file-name"> or drag and drop an audio file here</span>
+                        </div>
+                        <div class="mic-record">
+                            <button id="record-btn" class="button">Record</button>
+                            <button id="stop-btn" class="button" disabled>Stop</button>
+                            <span id="record-timer">00:00</span>
+                        </div>
+                    </div>
+                    <div class="input-limits">
+                        <p>Max file size: 25MB, Max duration: 5 minutes</p>
+                    </div>
+                </div>
+
+                <div class="control-group">
+                     <button id="transcribe-btn" class="button-primary" disabled>3. Transcribe</button>
+                </div>
+            </div>
+
+            <div id="status" class="status-area info">
+                <div id="loading-spinner" class="spinner" style="display: none;"></div>
+                <p id="status-message">Ready. Select a model and provide audio.</p>
+            </div>
+
+            <div id="results" class="card results-area" style="display: none;">
+                <h2>Transcription Results</h2>
+                <div class="results-controls">
+                    <button id="play-btn" class="button">Play Transcription</button>
+                </div>
+                <div id="sheet-music-container"></div>
+                <div class="visualization">
+                    <canvas id="piano-roll-canvas" width="1000" height="400"></canvas>
+                </div>
+            </div>
+        </main>
+        
+        <footer>
+            <p>Built on the OnV+Pedal project.</p>
+        </footer>
+    </div>
+
+<script src="{{ url_for('static', filename='js/main.js') }}"></script>
+</body>
+</html>

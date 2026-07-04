@@ -229,6 +229,6 @@ class OnsetsAndVelocities(torch.nn.Module):
         velocities = self.velocity_stage(stem_out).squeeze(1)  # (b, out_height, t)
         pedals_per_key = self.pedal_stage(stem_out).squeeze(1)  # (b, out_height, t) - per-key pedal predictions
         # Average across keys to get single pedal signal: (b, out_height, t) -> (b, 1, t)
-        pedals = pedals_per_key.mean(dim=1, keepdim=True)
+        pedals = pedals_per_key.mean(dim=1, keepdim=True).squeeze(2)
         #
         return x_stages, velocities, pedals

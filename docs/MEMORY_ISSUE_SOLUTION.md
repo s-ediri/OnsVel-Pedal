@@ -149,7 +149,7 @@ Possible causes:
 ### Before Running Evaluation:
 ```bash
 # Make sure using high enough threshold
-python 2_eval_onsets_velocities.py SEARCH_THRESHOLDS="[0.80]"
+python scripts/03_evaluate_pedal_model.py SEARCH_THRESHOLDS="[0.80]"
 ```
 
 ### Monitor Output:
@@ -161,17 +161,17 @@ Watch for these log messages:
 ### If Still Out of Memory:
 1. **Increase threshold further:**
    ```bash
-   python 2_eval_onsets_velocities.py SEARCH_THRESHOLDS="[0.85]"
+   python scripts/03_evaluate_pedal_model.py SEARCH_THRESHOLDS="[0.85]"
    ```
 
 2. **Process even fewer validation files:**
    ```bash
-   python 2_eval_onsets_velocities.py XV_TAKE_ONE_EVERY=50
+   python scripts/03_evaluate_pedal_model.py XV_TAKE_ONE_EVERY=50
    ```
 
 3. **Lower the safety limit** (if needed):
    ```bash
-   python 2_eval_onsets_velocities.py MAX_PREDICTIONS_PER_FILE=20000
+   python scripts/03_evaluate_pedal_model.py MAX_PREDICTIONS_PER_FILE=20000
    ```
 
 ---
