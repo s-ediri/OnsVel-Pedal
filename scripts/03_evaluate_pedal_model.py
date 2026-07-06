@@ -24,12 +24,11 @@ import os
 
 # For omegaconf
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from omegaconf import OmegaConf
 
 from ov_piano import PIANO_MIDI_RANGE, HDF5PathManager
@@ -45,11 +44,47 @@ from ov_piano.eval import (
     threshold_eval_pedals,
     threshold_eval_single_file,
 )
-from ov_piano.inference import OnsetVelocityNmsDecoder, PedalDecoder, strided_inference
+from ov_piano.inference import (
+    OnsetVelocityNmsDecoder,
+    model_outputs_to_probabilities,
+    strided_inference,
+)
 from ov_piano.models.ov import OnsetsAndVelocities
-from ov_piano.utils import load_model
+from ov_piano.utils import format_load_model_warnings, load_model
 
 # import matplotlib.pyplot as plt
+
+
+EVALUATION_PRESETS: Dict[str, Dict[str, object]] = {
+    "quick": {
+        "XV_TAKE_ONE_EVERY": 50,
+        "SEARCH_THRESHOLDS": (0.85,),
+        "SEARCH_SHIFTS": (-0.01,),
+        "PEDAL_SEARCH_THRESHOLDS": (0.5,),
+        "MAX_PREDICTIONS_PER_FILE": 20000,
+        "INFERENCE_CHUNK_SIZE": 30,
+    },
+    "low_memory": {
+        "XV_TAKE_ONE_EVERY": 20,
+        "SEARCH_THRESHOLDS": (0.85,),
+        "SEARCH_SHIFTS": (-0.01,),
+        "PEDAL_SEARCH_THRESHOLDS": (0.3, 0.5, 0.7),
+        "MAX_PREDICTIONS_PER_FILE": 20000,
+        "INFERENCE_CHUNK_SIZE": 60,
+    },
+    "full": {
+        "XV_TAKE_ONE_EVERY": 1,
+        "SEARCH_THRESHOLDS": (0.70, 0.75, 0.80, 0.85),
+        "SEARCH_SHIFTS": (-0.03, -0.02, -0.01, 0.0, 0.01),
+        "PEDAL_SEARCH_THRESHOLDS": (0.3, 0.5, 0.7),
+        "MAX_PREDICTIONS_PER_FILE": 50000,
+        "INFERENCE_CHUNK_SIZE": 300,
+    },
+}
+
+
+def _preset_help() -> str:
+    return ", ".join(sorted(EVALUATION_PRESETS))
 
 
 # ##############################################################################
@@ -74,6 +109,9 @@ class ConfDef:
     :cvar XV_TAKE_ONE_EVERY: Since we are doing a (likely inefficient)
       grid search on the cross-validation set, and the size is considerable,
       we can use this parameter to take only one file from every N in the set.
+      Use the ``full`` preset for final/reportable metrics because shortened
+      validation searches are intended for smoke tests or memory-constrained
+      debugging only.
       Experiments show that taking 1 of 5 doesn't alter results significantly.
     :cvar SEARCH_THRESHOLDS: Before running the test, several thresholds are
       being searched via grid search on the cross-validation split. This list
@@ -104,6 +142,7 @@ class ConfDef:
     """
 
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
+    EVALUATION_PRESET: str = "low_memory"
     MAESTRO_PATH: str = os.path.join("datasets", "maestro", "maestro-v3.0.0")
     MAESTRO_VERSION: int = 3
     OUTPUT_DIR: str = "out"
@@ -115,10 +154,11 @@ class ConfDef:
         "datasets", "MAESTROv3_roll_quant=0.024_midivals=128_extendsus=True.h5"
     )
     SNAPSHOT_INPATH: str = os.path.join(
-        "out", "model_snapshots", "OnsetsAndVelocities_2026_06_28_04_08_45.096.torch"
+        "assets",
+        "OnsetsAndVelocities_2023_03_04_09_53_53.289step=43500_f1=0.9675__0.9480.torch",
     )
     #
-    CONV1X1: List[int] = (128, 128)  # MUST match checkpoint architecture!
+    CONV1X1: List[int] = (200, 200)  # MUST match checkpoint architecture!
     LEAKY_RELU_SLOPE: Optional[float] = 0.1
     #
     XV_TAKE_ONE_EVERY: int = 20  # Increased from 5 to reduce memory usage
@@ -147,7 +187,16 @@ class ConfDef:
 if __name__ == "__main__":
     CONF = OmegaConf.structured(ConfDef())
     cli_conf = OmegaConf.from_cli()
-    CONF = OmegaConf.merge(CONF, cli_conf)
+    preset_name = str(cli_conf.get("EVALUATION_PRESET", CONF.EVALUATION_PRESET))
+    if preset_name not in EVALUATION_PRESETS:
+        raise ValueError(
+            f"Unknown EVALUATION_PRESET={preset_name!r}. "
+            f"Choose one of: {_preset_help()}"
+        )
+    preset_conf = OmegaConf.create(EVALUATION_PRESETS[preset_name])
+    # Merge order: defaults < named preset < explicit CLI overrides.
+    # This lets users start from a preset while still overriding individual knobs.
+    CONF = OmegaConf.merge(CONF, preset_conf, cli_conf)
 
     # derivative globals + parse HDF5 filenames and ensure they are consistent
     (DATASET_NAME, SAMPLERATE, WINSIZE, HOPSIZE, MELBINS, FMIN, FMAX) = (
@@ -173,6 +222,21 @@ if __name__ == "__main__":
 
     txt_logger = ColorLogger(os.path.basename(__file__), TXT_LOG_OUTDIR)
     txt_logger.info("\n\nCONFIGURATION:\n" + OmegaConf.to_yaml(CONF) + "\n\n")
+    txt_logger.warning(
+        f"EVALUATION_PRESET={CONF.EVALUATION_PRESET!r}. Available presets: {_preset_help()}."
+    )
+    if CONF.XV_TAKE_ONE_EVERY != 1:
+        txt_logger.warning(
+            "NON-FINAL VALIDATION SEARCH: this run uses only every "
+            f"{CONF.XV_TAKE_ONE_EVERY} validation file(s). Use "
+            "EVALUATION_PRESET=full (XV_TAKE_ONE_EVERY=1) before reporting "
+            "validation-selected thresholds or final benchmark metrics."
+        )
+    else:
+        txt_logger.warning(
+            "FULL VALIDATION SEARCH: all validation files are used. This is the "
+            "recommended mode for reportable/final metrics."
+        )
 
     txt_logger.info("Loading datasets")
     metamaestro_xv = METAMAESTRO_CLASS(
@@ -196,7 +260,10 @@ if __name__ == "__main__":
 
     # shorten xv set to speed up cross validation times
     if CONF.XV_TAKE_ONE_EVERY != 1:
-        txt_logger.critical("SHORTENING XV SPLIT FOR FASTER CROSSVALIDATION!")
+        txt_logger.critical(
+            "SHORTENING XV SPLIT FOR FASTER CROSSVALIDATION! "
+            "Do not report validation-search metrics from this preset as final."
+        )
         maestro_xv.data = maestro_xv.data[:: CONF.XV_TAKE_ONE_EVERY]
         metamaestro_xv.data = metamaestro_xv.data[:: CONF.XV_TAKE_ONE_EVERY]
     #
@@ -221,9 +288,15 @@ if __name__ == "__main__":
         leaky_relu_slope=CONF.LEAKY_RELU_SLOPE,
         dropout_drop_p=0,
     ).to(CONF.DEVICE)
-    load_model(
-        model, CONF.SNAPSHOT_INPATH, eval_phase=True, to_cpu=(CONF.DEVICE == "cpu")
+    load_report = load_model(
+        model,
+        CONF.SNAPSHOT_INPATH,
+        eval_phase=True,
+        to_cpu=(CONF.DEVICE == "cpu"),
+        strict=False,
     )
+    for warning in format_load_model_warnings(load_report):
+        txt_logger.warning(f"CHECKPOINT LOAD WARNING: {warning}")
     # instantiate decoder
     decoder = OnsetVelocityNmsDecoder(
         num_piano_keys,
@@ -233,9 +306,6 @@ if __name__ == "__main__":
         vel_pad_left=1,
         vel_pad_right=1,
     )
-    # instantiate pedal decoder
-    pedal_decoder = PedalDecoder(num_pedals=1, threshold=0.5)
-
     ##############
     # XV INFERENCE
     ##############
@@ -244,16 +314,7 @@ if __name__ == "__main__":
         Convenience wrapper around the DNN to ensure output and input sequences
         have same length.
         """
-        probs, vels, pedals = model(x)
-
-        # Use the last onset stage
-        if isinstance(probs, (list, tuple)):
-            probs = probs[-1]
-
-        probs = F.pad(torch.sigmoid(probs), (1, 0))
-        vels = F.pad(torch.sigmoid(vels), (1, 0))
-        pedals = F.pad(torch.sigmoid(pedals), (1, 0))
-        return probs, vels, pedals
+        return model_outputs_to_probabilities(model(x), include_pedals=True)
 
     len_xv = len(maestro_xv)
     xv_dataframes = []
@@ -290,10 +351,6 @@ if __name__ == "__main__":
                 num_preds = len(pred_df)
                 gt_df = xv_gts(md)[0]
                 gt_pedal_df = xv_gts.get_sus_pedal_events(md, SECS_PER_FRAME)
-                # Add pedal_idx column for sustain pedal (index 0)
-                if not gt_pedal_df.empty:
-                    gt_pedal_df = gt_pedal_df.copy()
-                    gt_pedal_df["pedal_idx"] = 0
                 num_gt = len(gt_df)
 
                 if num_preds > CONF.MAX_PREDICTIONS_PER_FILE:
@@ -480,10 +537,6 @@ if __name__ == "__main__":
                 )
                 gt_df = test_gts(md)[0]
                 gt_pedal_df = test_gts.get_sus_pedal_events(md, SECS_PER_FRAME)
-                # Add pedal_idx column for sustain pedal (index 0)
-                if not gt_pedal_df.empty:
-                    gt_pedal_df = gt_pedal_df.copy()
-                    gt_pedal_df["pedal_idx"] = 0
                 # Process pedal predictions
                 if pedal_pred.dim() == 2:
                     pedal_pred = pedal_pred.unsqueeze(0)  # Add batch dimension
@@ -576,8 +629,16 @@ if __name__ == "__main__":
     txt_logger.warning(
         "TEST RESULTS WITH BEST XV HYPERPARS "
         + f"(MAESTROv{CONF.MAESTRO_VERSION}, "
-        + f"{CONF.SNAPSHOT_INPATH})\n"
+        + f"{CONF.SNAPSHOT_INPATH}, "
+        + f"preset={CONF.EVALUATION_PRESET}, "
+        + f"xv_take_one_every={CONF.XV_TAKE_ONE_EVERY})\n"
     )
+    if CONF.XV_TAKE_ONE_EVERY != 1:
+        txt_logger.warning(
+            "IMPORTANT: these test results used hyperparameters selected from a "
+            "shortened validation split. Treat them as quick/diagnostic numbers; "
+            "rerun with EVALUATION_PRESET=full for final reporting."
+        )
     txt_logger.warning("ONSETS:\n" + str(test_results_df))
     txt_logger.warning("ONSETS+VELOCITIES:\n" + str(test_results_df_vel))
     txt_logger.warning("SUSTAIN PEDAL:\n" + str(test_results_df_pedal))

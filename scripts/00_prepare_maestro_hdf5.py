@@ -25,6 +25,7 @@ import numpy as np
 # import matplotlib.pyplot as plt
 #
 from ov_piano import HDF5PathManager
+from ov_piano.custom_logging import ColorLogger
 from ov_piano.utils import IncrementalHDF5
 from ov_piano.utils import TorchWavToLogmel, torch_load_resample_audio
 from ov_piano.data.maestro import MetaMAESTROv1, MetaMAESTROv2, MetaMAESTROv3
@@ -81,11 +82,11 @@ class ConfDef:
 # # MAIN ROUTINE
 # ##############################################################################
 if __name__ == "__main__":
+    txt_logger = ColorLogger(os.path.basename(__file__))
     CONF = OmegaConf.structured(ConfDef())
     cli_conf = OmegaConf.from_cli()
     CONF = OmegaConf.merge(CONF, cli_conf)
-    print("\n\nCONFIGURATION:")
-    print(OmegaConf.to_yaml(CONF), end="\n\n\n")
+    txt_logger.info("\n\nCONFIGURATION:\n" + OmegaConf.to_yaml(CONF) + "\n\n")
 
     # derivative globals
     MAESTRO_METACLASS = {1: MetaMAESTROv1, 2: MetaMAESTROv2,
@@ -134,10 +135,10 @@ if __name__ == "__main__":
         compression="lzf", data_chunk_length=HDF5_CHUNKLEN,
         metadata_chunk_length=HDF5_CHUNKLEN, err_if_exists=True)
 
-    print("Computing features...")
+    txt_logger.info("Computing features...")
     if not CONF.IGNORE_MEL:
-        print("Logmels stored into", HDF5_MEL_OUTPATH)
-    print("Piano rolls stored into", HDF5_ROLL_OUTPATH)
+        txt_logger.info("Logmels stored into %s", HDF5_MEL_OUTPATH)
+    txt_logger.info("Piano rolls stored into %s", HDF5_ROLL_OUTPATH)
     loop_length = len(all_maestro.data)
 
     for i, (path, meta) in enumerate(all_maestro.data, 1):
@@ -171,8 +172,6 @@ if __name__ == "__main__":
             assert len_logmel >= len_roll, \
                 "Wav isn't expected to be shorter than MIDI!"
             if len_logmel > len_roll:
-                # print("WARNING: wav is longer than MIDI.",
-                #       "Padding MIDI end with zeros")
                 roll = np.pad(roll, ((0, 0), (0, len_logmel - len_roll)))
             assert len_logmel == roll.shape[1], \
                 "Logmel and roll have different length?"
@@ -182,9 +181,9 @@ if __name__ == "__main__":
         h5roll.append(roll, metadata)
         #
         if (i % 5) == 0:
-            print(f"[{i}/{loop_length}]", abspath)
+            txt_logger.info("[%d/%d] %s", i, loop_length, abspath)
 
     if not CONF.IGNORE_MEL:
         h5mel.close()
     h5roll.close()
-    print("Done!")
+    txt_logger.info("Done!")

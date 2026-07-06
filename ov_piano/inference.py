@@ -46,54 +46,30 @@ def strided_inference(model, x, chunk_size=10000, chunk_overlap=0):
     # compute strided inference
     # results is in the form [(out1a, out1b, ...), (out2a, out2b...)]
     results = []
-    result_lengths = []
     for beg in range(0, in_w, stride):
         chunk = x[..., beg:beg+chunk_size]
         outputs = model(chunk)
-        # Guard against invalid or unexpected model returns
-        if outputs is None:
-            outputs = []
-        try:
-            outputs = [o.cpu().detach() for o in outputs]
-        except Exception:
-            # Try to coerce single-tensor return
-            if isinstance(outputs, torch.Tensor):
-                try:
-                    outputs = [outputs.cpu().detach()]
-                except Exception:
-                    outputs = []
-            else:
-                outputs = []
+        assert isinstance(outputs, (list, tuple)), \
+            "model must return a list or tuple of output tensors!"
+        assert len(outputs) >= 2, \
+            "model must return at least 2 outputs (probs, vels)!"
+        assert all(isinstance(o, torch.Tensor) for o in outputs), \
+            "all model outputs must be tensors!"
+        outputs = [o.cpu().detach() for o in outputs]
 
-        # If outputs is empty, skip this chunk
-        if len(outputs) == 0:
-            result_lengths.append(chunk.shape[-1])
-            del chunk
-            # ensure outputs removed
-            try:
-                del outputs
-            except Exception:
-                pass
-            continue
-
-        # Handle variable number of model outputs (for compatibility)
-        assert len(outputs) >= 2, "Model must return at least 2 outputs (probs, vels)"
-
-        # Validate all outputs have correct batch size and time dimension
+        # Validate all outputs have correct batch size and time dimension.
+        # Height/channel dimensions may legitimately differ per output
+        # (for example notes vs. pedal predictions).
         assert all(o.shape[0] == chunk.shape[0] for o in outputs), \
             "all b_outputs must equal b_in!"
         assert all(o.shape[-1] == chunk.shape[-1] for o in outputs), \
             "all t_outputs must equal t_in!"
 
         results.append(outputs)
-        result_lengths.append(chunk.shape[-1])
         del chunk
         del outputs
 
-    # For >1 chunks, at most 1 partial-length chunk at the end is allowed
-    valid_chunks = sum(x == chunk_size for x in result_lengths)
-    extra_chunks = int(sum(x != chunk_size for x in result_lengths) > 0)
-    results = results[:(valid_chunks + extra_chunks)]
+    assert len(results) > 0, "model produced no outputs!"
 
     # gather concatenated results
     t_results = []
@@ -113,6 +89,33 @@ def strided_inference(model, x, chunk_size=10000, chunk_overlap=0):
         t_results.append(result)
     #
     return t_results
+
+
+def model_outputs_to_probabilities(outputs, include_pedals=True):
+    """Convert raw model outputs into padded probability maps.
+
+    The DNN predicts ``t-1`` frames because it uses first-order differences.
+    Padding is applied *after* sigmoid so the synthetic first frame is zero,
+    not 0.5. This avoids false first-frame note or pedal events.
+    """
+    if len(outputs) < 2:
+        raise ValueError("model outputs must include at least onsets and velocities")
+
+    onset_logits, velocity_logits = outputs[:2]
+    if isinstance(onset_logits, (list, tuple)):
+        onset_logits = onset_logits[-1]
+
+    onset_probs = F.pad(torch.sigmoid(onset_logits), (1, 0))
+    velocity_probs = F.pad(torch.sigmoid(velocity_logits), (1, 0))
+
+    if not include_pedals:
+        return onset_probs, velocity_probs
+
+    if len(outputs) < 3:
+        return onset_probs, velocity_probs, None
+
+    pedal_probs = F.pad(torch.sigmoid(outputs[2]), (1, 0))
+    return onset_probs, velocity_probs, pedal_probs
 
 
 # ##############################################################################
@@ -320,6 +323,8 @@ class PedalDecoder(torch.nn.Module):
         self.hysteresis = hysteresis
         self.min_hold_steps = max(1, int(min_hold_steps))
         self.smoothing_window = max(1, int(smoothing_window))
+        if self.smoothing_window % 2 == 0:
+            self.smoothing_window += 1
 
     @staticmethod
     def logits_to_probs(logits):

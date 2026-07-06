@@ -1,0 +1,52 @@
+name: onsvel
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  # Python 3.9 keeps compatibility with the pinned PyTorch 1.11 / torchaudio 0.11 stack.
+  - python=3.9
+  - pip=23.3
+  - setuptools>=77
+  - wheel>=0.41
+
+  # Windows-friendly CPU PyTorch stack for reproducible local testing.
+  # For CUDA training, replace `cpuonly` with the PyTorch CUDA package that matches your driver.
+  - pytorch=1.11.0
+  - torchaudio=0.11.0
+  - cpuonly=2.0
+
+  # Core scientific/runtime dependencies.
+  # ffmpeg is included for pydub-backed decoding of non-WAV uploads on Windows.
+  - ffmpeg=6.1
+  - flask=2.3.3
+  - h5py=3.8.0
+  - matplotlib=3.7.2
+  - numpy=1.23.5
+  - pandas=1.5.3
+  - pillow=9.5.0
+  - psutil=5.9.5
+  - pytest=7.4.3
+  - pytz=2023.3
+  - pyyaml=6.0.1
+  - scipy=1.10.1
+  - werkzeug=2.3.7
+
+  # Pure-Python/project packages that are most reliably installed from PyPI on Windows.
+  # The editable project install keeps direct `python scripts/...` entry points working.
+  # Keep it after the pinned runtime packages so pip sees those dependencies as satisfied.
+  - pip:
+      - antlr4-python3-runtime==4.8
+      - coloredlogs==15.0.1
+      - decorator==5.1.1
+      - future==1.0.0
+      - humanfriendly==10.0
+      - mido==1.2.10
+      - mir-eval==0.7
+      - omegaconf==2.1.2
+      - parse==1.19.0
+      - pydub==0.25.1
+      - "audioop-lts==0.2.2; python_version >= '3.13'"
+      - six==1.17.0
+      - unidecode==1.3.6
+      - -e .

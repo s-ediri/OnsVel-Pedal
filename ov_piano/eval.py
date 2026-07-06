@@ -126,6 +126,9 @@ class GtLoaderMaestro(GtLoaderMaps):
 
         # Convert sustain pedal states to events
         sus_pedal_events = sus_states_to_events(sus_states)
+        if not sus_pedal_events.empty:
+            sus_pedal_events = sus_pedal_events.copy()
+            sus_pedal_events["pedal_idx"] = 0
         return sus_pedal_events
 
 
@@ -253,139 +256,48 @@ def threshold_eval_single_file(
     return (prec, rec, f1), (prec_v, rec_v, f1_v)
 
 # ##############################################################################
-# # SUSTAIN PEDAL EVALUATION
-# ##############################################################################
-def eval_sus_pedal_simple(gt_events_df, pred_events_df, tol_secs=0.05):
-    """
-    Simple sustain pedal evaluation comparing onset/offset events.
-    
-    :param gt_events_df: Ground truth pedal events DataFrame with ['onset', 'event_type']
-    :param pred_events_df: Predicted pedal events DataFrame with ['onset', 'event_type']  
-    :param tol_secs: Time tolerance in seconds
-    :returns: (precision, recall, f1) for sustain pedal events
-    """
-    if not gt_events_df.empty:
-        if pred_events_df.empty:
-            return 0.0, 0.0, 0.0
-    else:
-        if pred_events_df.empty:
-            return 1.0, 1.0, 1.0
-        return 0.0, 1.0, 0.0
-
-    tp = 0  # True positives
-    fp = 0  # False positives
-
-    matched_gt = set()
-
-    for _, pred_row in pred_events_df.iterrows():
-        pred_time = pred_row["onset"]
-        pred_type = pred_row["event_type"]
-
-        # Find matching GT event
-        best_match = None
-        best_dist = tol_secs
-
-        for gt_idx, gt_row in gt_events_df.iterrows():
-            if gt_idx in matched_gt:
-                continue
-
-            if gt_row["event_type"] != pred_type:
-                continue
-
-            dist = abs(pred_time - gt_row["onset"])
-            if dist < best_dist:
-                best_match = gt_idx
-                best_dist = dist
-
-        if best_match is not None:
-            tp += 1
-            matched_gt.add(best_match)
-        else:
-            fp += 1
-
-    fn = len(gt_events_df) - len(matched_gt)
-
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-
-    return precision, recall, f1
-
-
-# ##############################################################################
 # # PEDAL EVALUATION
 # ##############################################################################
-def eval_pedal_events(gt_onsets, gt_pedals, pred_onsets, pred_pedals, 
-                      tol_secs=0.05):
-    """
-    Evaluate pedal event detection accuracy.
-    
-    Similar to eval_note_events but for binary pedal state detection.
-    Compares ground truth vs predicted pedal onset/offset times.
-    
-    :param gt_onsets: Ground truth pedal event times (seconds)
-    :param gt_pedals: Ground truth pedal states (0=off, 1=on)
-    :param pred_onsets: Predicted pedal event times (seconds)
-    :param pred_pedals: Predicted pedal states (0=off, 1=on)
-    :param tol_secs: Time tolerance in seconds (default 50ms)
-    :returns: Tuple (precision, recall, f1_score)
-    """
-    # If no events, return perfect score for empty predictions, 0 otherwise
-    if gt_onsets.size > 0:
-        if pred_onsets.size == 0:
-            return 0.0, 0.0, 0.0
-    else:
-        if pred_onsets.size == 0:
-            return 1.0, 1.0, 1.0
-        return 0.0, 1.0, 0.0
-
-    # Match predictions to ground truth within tolerance window
-    tp = 0  # True positives
-    fp = 0  # False positives
-
-    matched_gt = set()
-
-    for pred_t, pred_state in zip(pred_onsets, pred_pedals):
-        # Find closest GT event within tolerance
-        best_match = None
-        best_dist = tol_secs
-
-        for gt_idx, (gt_t, gt_state) in enumerate(zip(gt_onsets, gt_pedals)):
-            if gt_idx in matched_gt:
-                continue
-
-            dist = abs(pred_t - gt_t)
-            if dist < best_dist and pred_state == gt_state:
-                best_match = gt_idx
-                best_dist = dist
-
-        if best_match is not None:
-            tp += 1
-            matched_gt.add(best_match)
-        else:
-            fp += 1
-
-    # Remaining unmatched GTs are false negatives
-    fn = len(gt_onsets) - len(matched_gt)
-
-    # Compute metrics
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * (precision * recall) / (precision + recall) \
-        if (precision + recall) > 0 else 0.0
-
-    return precision, recall, f1
-
-
-def _score_event_type(gt_events_df, pred_events_df, tol_secs):
+def eval_sus_pedal_simple(gt_events_df, pred_events_df, tol_secs=0.05):
+    """Score sustain-pedal onset/offset events with one-to-one matching."""
     if len(gt_events_df) == 0 and len(pred_events_df) == 0:
         return 1.0, 1.0, 1.0
     if len(gt_events_df) == 0:
         return 0.0, 1.0, 0.0
     if len(pred_events_df) == 0:
         return 0.0, 0.0, 0.0
-    return eval_sus_pedal_simple(gt_events_df, pred_events_df,
-                                  tol_secs=tol_secs)
+
+    tp = 0
+    matched_gt = set()
+    for _, pred_row in pred_events_df.iterrows():
+        candidates = gt_events_df[
+            (gt_events_df["event_type"] == pred_row["event_type"])
+            & (~gt_events_df.index.isin(matched_gt))
+        ]
+        if candidates.empty:
+            continue
+        distances = (candidates["onset"] - pred_row["onset"]).abs()
+        best_idx = distances.idxmin()
+        if distances.loc[best_idx] <= tol_secs:
+            matched_gt.add(best_idx)
+            tp += 1
+
+    fp = len(pred_events_df) - tp
+    fn = len(gt_events_df) - len(matched_gt)
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    return precision, recall, f1
+
+
+def _empty_pedal_results(num_pedals=1):
+    pedal_names = ["sustain", "soft", "tenuto"][:num_pedals]
+    results = {
+        name: {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+        for name in pedal_names
+    }
+    results["macro_avg"] = {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+    return results
 
 
 def _prepare_pedal_data(pred_pedal_probs):
@@ -428,7 +340,7 @@ def threshold_eval_pedals(gt_pedal_events, pred_pedal_probs, secs_per_frame, thr
     events_df = _decode_pedal_predictions(pred_pedal_probs, thresh)
 
     if events_df is None:
-        return {"sustain": {"precision": 0.0, "recall": 0.0, "f1": 0.0}, "soft": {"precision": 0.0, "recall": 0.0, "f1": 0.0}, "tenuto": {"precision": 0.0, "recall": 0.0, "f1": 0.0}, "macro_avg": {"precision": 0.0, "recall": 0.0, "f1": 0.0}}
+        return _empty_pedal_results(pred_pedal_probs.shape[1])
 
     if "t_idx" in events_df.columns:
         events_df["onset"] = (events_df["t_idx"].astype(float) * float(secs_per_frame)) + float(shift_preds)
@@ -449,10 +361,10 @@ def threshold_eval_pedals(gt_pedal_events, pred_pedal_probs, secs_per_frame, thr
         gt_events_df = pd.DataFrame({"onset": gt_onsets, "event_type": gt_types})
         pred_events_df = pd.DataFrame({"onset": pred_onsets, "event_type": pred_types})
 
-        onset_prec, onset_rec, onset_f1 = _score_event_type(gt_events_df[gt_events_df["event_type"] == "onset"], pred_events_df[pred_events_df["event_type"] == "onset"], tol_secs)
-        offset_prec, offset_rec, offset_f1 = _score_event_type(gt_events_df[gt_events_df["event_type"] == "offset"], pred_events_df[pred_events_df["event_type"] == "offset"], tol_secs)
+        onset_prec, onset_rec, onset_f1 = eval_sus_pedal_simple(gt_events_df[gt_events_df["event_type"] == "onset"], pred_events_df[pred_events_df["event_type"] == "onset"], tol_secs)
+        offset_prec, offset_rec, offset_f1 = eval_sus_pedal_simple(gt_events_df[gt_events_df["event_type"] == "offset"], pred_events_df[pred_events_df["event_type"] == "offset"], tol_secs)
 
-        prec, rec, f1 = _score_event_type(gt_events_df, pred_events_df, tol_secs)
+        prec, rec, f1 = eval_sus_pedal_simple(gt_events_df, pred_events_df, tol_secs)
 
         results[pedal_name] = {"precision": prec, "recall": rec, "f1": f1, "onset_precision": onset_prec, "onset_recall": onset_rec, "onset_f1": onset_f1, "offset_precision": offset_prec, "offset_recall": offset_rec, "offset_f1": offset_f1}
 

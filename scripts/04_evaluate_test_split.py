@@ -16,17 +16,20 @@ from dataclasses import dataclass
 from typing import Optional, List
 
 import torch
-import torch.nn.functional as F
 import numpy as np
 from omegaconf import OmegaConf
 
 from ov_piano import PIANO_MIDI_RANGE, HDF5PathManager
-from ov_piano.utils import load_model
+from ov_piano.utils import format_load_model_warnings, load_model
 from ov_piano.custom_logging import ColorLogger
 from ov_piano.data.maestro import MetaMAESTROv1, MetaMAESTROv2, MetaMAESTROv3
 from ov_piano.data.maestro import MelMaestro
 from ov_piano.models.ov import OnsetsAndVelocities
-from ov_piano.inference import strided_inference, OnsetVelocityNmsDecoder, PedalDecoder
+from ov_piano.inference import (
+    strided_inference,
+    OnsetVelocityNmsDecoder,
+    model_outputs_to_probabilities,
+)
 from ov_piano.eval import GtLoaderMaestro, threshold_eval_single_file, threshold_eval_pedals
 
 
@@ -108,7 +111,9 @@ if __name__ == "__main__":
         bn_momentum=0,
         leaky_relu_slope=CONF.LEAKY_RELU_SLOPE,
         dropout_drop_p=0).to(CONF.DEVICE)
-    load_model(model, CONF.SNAPSHOT_INPATH, eval_phase=True, strict=False)
+    load_report = load_model(model, CONF.SNAPSHOT_INPATH, eval_phase=True, strict=False)
+    for warning in format_load_model_warnings(load_report):
+        txt_logger.warning(f"CHECKPOINT LOAD WARNING: {warning}")
 
     decoder = OnsetVelocityNmsDecoder(
         num_piano_keys,
@@ -117,23 +122,9 @@ if __name__ == "__main__":
         gauss_conv_ksize=CONF.DECODER_GAUSS_KSIZE,
         vel_pad_left=1,
         vel_pad_right=1)
-    pedal_decoder = PedalDecoder(num_pedals=1, threshold=0.5)
-
     def model_inference(x):
         try:
-            out = model(x)
-            if out is None:
-                return (), (), ()
-            if isinstance(out, (list, tuple)) and len(out) >= 3:
-                probs, vels, pedals = out
-            else:
-                return (), (), ()
-            if isinstance(probs, (list, tuple)):
-                probs = probs[-1]
-            probs = F.pad(torch.sigmoid(probs), (1, 0))
-            vels = F.pad(torch.sigmoid(vels), (1, 0))
-            pedals = F.pad(torch.sigmoid(pedals), (1, 0))
-            return probs, vels, pedals
+            return model_outputs_to_probabilities(model(x), include_pedals=True)
         except Exception as e:
             txt_logger.error(f"model_inference exception: {e}")
             return (), (), ()
@@ -162,9 +153,6 @@ if __name__ == "__main__":
 
                 gt_df = test_gts(md)[0]
                 gt_pedal_df = test_gts.get_sus_pedal_events(md, SECS_PER_FRAME)
-                if not gt_pedal_df.empty:
-                    gt_pedal_df = gt_pedal_df.copy()
-                    gt_pedal_df["pedal_idx"] = 0
 
                 num_preds = len(pred_df)
                 num_gt = len(gt_df)
@@ -178,7 +166,7 @@ if __name__ == "__main__":
             txt_logger.error(f"ERROR processing {md[0]}: {e}")
             continue
         finally:
-            for v in ("mel", "roll", "onset_pred", "vel_pred", "pedal_pred", "tmel", " _res"):
+            for v in ("mel", "roll", "onset_pred", "vel_pred", "pedal_pred", "tmel", "_res"):
                 if v in locals():
                     try:
                         del locals()[v]

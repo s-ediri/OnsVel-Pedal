@@ -1,23 +1,58 @@
 # Quick Start: Running Pedal-Aware Evaluation
 
 ## Prerequisites
-- Conda environment `onsvel` activated
-- Trained model checkpoint in `out/model_snapshots/`
+- Conda or Miniconda available on Windows
+- Conda environment `onsvel` created from the repository root `environment.yml`
+- Trained model checkpoint in `out/model_snapshots/`, or a documented release/download checkpoint copied there
 - Datasets in `datasets/` directory
 
-## Step 1: Activate Environment
+> **Checkpoint policy:** `.torch` checkpoints are generated binary artifacts and are ignored by Git. Do not commit new checkpoints or move them to Git LFS for normal development. Share selected models as versioned release/download artifacts and document the URL, filename, expected local path, and checksum/metric metadata.
+
+## Step 1: Create and Validate Environment
 ```bash
+conda env create -f environment.yml
 conda activate onsvel
+python -m pytest tests -q
 ```
+
+If the environment already exists, use `conda env update -f environment.yml --prune` instead of `conda env create -f environment.yml`.
+
+For a clean reproducible reset, especially if you previously installed packages with pip inside `onsvel`, remove and recreate the environment:
+
+```bash
+conda env remove -n onsvel
+conda env create -f environment.yml
+conda activate onsvel
+python -m pytest tests -q
+```
+
+Run the commands above from the repository root. `environment.yml` installs the project in editable mode (`-e .`) after the pinned Conda packages are present, so direct commands such as `python scripts/03_evaluate_pedal_model.py` can import `ov_piano`. If you only need to refresh that editable install later, run `python -m pip install --no-deps --no-build-isolation -e .` after activating `onsvel`. Avoid ad-hoc `pip install --upgrade ...` commands inside `onsvel`; use the clean reset commands above to return to the pinned environment.
 
 ## Step 2: Run Evaluation
+
+Evaluation now has named presets so diagnostic runs are not confused with final metrics:
+
+| Preset | Purpose | Validation split | Report as final? |
+|--------|---------|------------------|------------------|
+| `quick` | Smoke test that the checkpoint, data paths, and pedal metrics work | Highly shortened (`XV_TAKE_ONE_EVERY=50`) | **No** |
+| `low_memory` | Default memory-safe run for 8GB-class GPUs | Shortened (`XV_TAKE_ONE_EVERY=20`) | **No** |
+| `full` | Final benchmark/reporting run | Full validation split (`XV_TAKE_ONE_EVERY=1`) | **Yes** |
+
 ```bash
-# Using the default checkpoint (latest in out/model_snapshots/)
-python scripts/03_evaluate_pedal_model.py
+# Fast smoke test only. Do not report these metrics as final.
+python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=quick
+
+# Memory-safe diagnostic/default run. Do not report these metrics as final.
+python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=low_memory
+
+# Final/reportable metrics: uses the full validation split for threshold search.
+python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=full
 
 # Or specify a specific checkpoint:
-python scripts/03_evaluate_pedal_model.py SNAPSHOT_INPATH="out/model_snapshots/YOUR_MODEL.torch"
+python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=full SNAPSHOT_INPATH="out/model_snapshots/YOUR_MODEL.torch"
 ```
+
+> **Important:** `quick` and `low_memory` still evaluate the test split, but their thresholds are selected from a shortened validation split. Treat those results as diagnostic only. Rerun with `EVALUATION_PRESET=full` before publishing or comparing final metrics.
 
 ## Step 3: Check Results
 Results will be printed to console and saved to `out/txt_logs/`
@@ -49,6 +84,19 @@ ONSETS+VELOCITIES:
 conda activate onsvel
 ```
 
+### Error: "No module named 'pyaudioop'" when reading audio
+**Cause:** You are likely running the app or CLI with Python 3.13+ outside the supported `onsvel` Conda environment. Python 3.13 removed the stdlib `audioop` module that `pydub` expects.
+
+**Preferred solution:** Use the project environment:
+```bash
+conda activate onsvel
+```
+
+**Pip-only workaround:** Install the compatibility package, then make sure `ffmpeg` is also installed and available on `PATH` for MP3/non-WAV decoding:
+```bash
+python -m pip install audioop-lts
+```
+
 ### Error: "ValueError: too many values to unpack"
 **Solution:** This was the main issue - FIXED in [03_evaluate_pedal_model.py](03_evaluate_pedal_model.py:218)
 
@@ -59,9 +107,9 @@ ls out/model_snapshots/
 ```
 
 ### Out of Memory (OOM)
-**Solution:** Reduce chunk size in evaluation:
+**Solution:** Start from the `low_memory` preset, then reduce chunk size if needed:
 ```bash
-python scripts/03_evaluate_pedal_model.py INFERENCE_CHUNK_SIZE=60.0
+python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=low_memory INFERENCE_CHUNK_SIZE=30.0
 ```
 
 ## Configuration Options
@@ -69,6 +117,11 @@ python scripts/03_evaluate_pedal_model.py INFERENCE_CHUNK_SIZE=60.0
 You can override any configuration parameter via command line:
 
 ```bash
+# Select a named preset
+python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=quick
+python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=low_memory
+python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=full
+
 # Use smaller chunks (for limited memory)
 python scripts/03_evaluate_pedal_model.py INFERENCE_CHUNK_SIZE=100
 
@@ -81,6 +134,8 @@ python scripts/03_evaluate_pedal_model.py DEVICE="cpu"
 # Process only every Nth validation file (faster)
 python scripts/03_evaluate_pedal_model.py XV_TAKE_ONE_EVERY=10
 ```
+
+If `XV_TAKE_ONE_EVERY` is not `1`, the validation search is shortened and the script will warn that the resulting validation-selected thresholds and test metrics are not final/reportable.
 
 ## Alternative Evaluation Scripts
 
@@ -119,7 +174,7 @@ python eval_with_pedals.py
 - Probability threshold for onset detection
 - Lower threshold → more detections (higher recall, lower precision)
 - Higher threshold → fewer detections (higher precision, lower recall)
-- Optimal threshold found via cross-validation
+- Optimal threshold found via cross-validation. Use `EVALUATION_PRESET=full` when the threshold will be used for final metrics.
 
 ### Shift (s)
 - Time offset applied to predictions (in seconds)

@@ -184,8 +184,17 @@ sustain_beg, sustain_end = 2 * NUM_MIDI_VALUES, 2 * NUM_MIDI_VALUES + 1
 **Usage:**
 ```bash
 conda activate onsvel
-python scripts/03_evaluate_pedal_model.py SNAPSHOT_INPATH="out/model_snapshots/YOUR_MODEL.torch"
+# Smoke test only; shortened validation search, not final metrics.
+python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=quick SNAPSHOT_INPATH="out/model_snapshots/YOUR_MODEL.torch"
+
+# Memory-safe diagnostic run; shortened validation search, not final metrics.
+python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=low_memory SNAPSHOT_INPATH="out/model_snapshots/YOUR_MODEL.torch"
+
+# Final/reportable metrics; full validation search.
+python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=full SNAPSHOT_INPATH="out/model_snapshots/YOUR_MODEL.torch"
 ```
+
+**Preset policy:** Do not publish metrics from `quick`, `low_memory`, or any run with `XV_TAKE_ONE_EVERY != 1`. Those modes select thresholds from a shortened validation split. Use `EVALUATION_PRESET=full` before reporting validation-selected thresholds or final test metrics.
 
 **Outputs:**
 - Precision, Recall, F1 for **onsets only**
@@ -193,6 +202,7 @@ python scripts/03_evaluate_pedal_model.py SNAPSHOT_INPATH="out/model_snapshots/Y
 - Grid search over thresholds and time shifts
 - Validation set hyperparameter tuning
 - Test set final results
+- Explicit log warnings when the validation search is shortened
 
 ### 2. Alternative Evaluation (Memory-Efficient)
 **File:** [simple_eval.py](simple_eval.py)
@@ -283,7 +293,12 @@ if CONF.TRAIN_BS == 1:
 1. **Test the evaluation script:**
    ```bash
    conda activate onsvel
-   python scripts/03_evaluate_pedal_model.py
+   python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=quick
+   ```
+
+   For final metrics, rerun with:
+   ```bash
+   python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=full
    ```
 
 2. **Monitor training progress:**

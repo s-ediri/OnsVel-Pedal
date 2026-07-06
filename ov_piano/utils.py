@@ -11,6 +11,8 @@ various modules and applications.
 import os
 import json
 import random
+from collections import OrderedDict
+from typing import Optional
 #
 import torch
 import torchaudio
@@ -137,8 +139,6 @@ class IncrementalHDF5:
 # ##############################################################################
 # # AUDIO PREPROCESSING
 # ##############################################################################
-from typing import Optional
-
 def torch_resample_audio(wave: torch.Tensor, sr_in: int, target_sr: int, mono: bool = True, device: str = "cpu") -> torch.Tensor:
     """
     Resamples a wave tensor.
@@ -200,9 +200,17 @@ class TorchWavToLogmel(torch.nn.Module):
             power=2, window_fn=window_fn)
         self.to_db = AmplitudeToDB(stype="power", top_db=80.0)
         # run melspec once, otherwise produces NaNs!
-        self.melspec(torch.rand(winsize * 10))
+        self._warm_up_melspec(winsize)
 
-    def __call__(self, wav_arr):
+    def _module_device(self) -> torch.device:
+        """Return the current device of this module's tensors."""
+        return self.melspec.spectrogram.window.device
+
+    def _warm_up_melspec(self, winsize: int) -> None:
+        """Initialize torchaudio internals without changing module device semantics."""
+        self.melspec(torch.rand(winsize * 10, device=self._module_device()))
+
+    def forward(self, wav_arr):
         """
         :param wav_arr: Float tensor array of either 1D or ``(chans, time)``
         :returns: log-mel spectrogram of shape ``(n_mels, t)``
@@ -226,18 +234,116 @@ def save_model(model, path):
     torch.save(model.state_dict(), path)
 
 
+def _shape_tuple(value):
+    """Return a printable tensor-like shape, or ``None`` for non-shaped values."""
+    return tuple(value.shape) if hasattr(value, "shape") else None
+
+
+def format_load_model_warnings(report):
+    """Format non-strict checkpoint loading diagnostics as warning strings."""
+    warnings = []
+    if not report or report.get("strict", True):
+        return warnings
+
+    path = report.get("path", "<unknown checkpoint>")
+    missing_keys = report.get("missing_keys", [])
+    unexpected_keys = report.get("unexpected_keys", [])
+    shape_mismatched_keys = report.get("shape_mismatched_keys", [])
+
+    if missing_keys:
+        warnings.append(
+            f"Checkpoint '{path}' is missing {len(missing_keys)} model key(s): "
+            + ", ".join(missing_keys)
+        )
+    if unexpected_keys:
+        warnings.append(
+            f"Checkpoint '{path}' has {len(unexpected_keys)} unexpected key(s): "
+            + ", ".join(unexpected_keys)
+        )
+    if shape_mismatched_keys:
+        details = []
+        for item in shape_mismatched_keys:
+            details.append(
+                f"{item['key']} checkpoint_shape={item['checkpoint_shape']} "
+                f"model_shape={item['model_shape']}"
+            )
+        warnings.append(
+            f"Checkpoint '{path}' has {len(shape_mismatched_keys)} shape-mismatched key(s) skipped: "
+            + "; ".join(details)
+        )
+    return warnings
+
+
 def load_model(model, path, eval_phase=True, strict=True, to_cpu=False):
     """
+    Load a PyTorch state dict into ``model``.
+
+    When ``strict=False``, shape-incompatible checkpoint entries are skipped so
+    partially compatible checkpoints can still be loaded. A diagnostics report is
+    returned with missing model keys, unexpected checkpoint keys, and skipped
+    shape-mismatched checkpoint keys. Existing callers may ignore the return
+    value, but callers that perform non-strict loading should log it.
     """
     try:
         state_dict = torch.load(path, map_location="cpu" if to_cpu else None)
     except RuntimeError as exc:
         raise RuntimeError(f"Failed to load PyTorch checkpoint '{path}': {exc}") from exc
-    model.load_state_dict(state_dict, strict=strict)
+
+    report = {
+        "path": path,
+        "strict": strict,
+        "missing_keys": [],
+        "unexpected_keys": [],
+        "shape_mismatched_keys": [],
+    }
+
+    if not strict:
+        model_state = model.state_dict()
+        filtered_state_dict = OrderedDict()
+        if hasattr(state_dict, "_metadata"):
+            filtered_state_dict._metadata = state_dict._metadata
+        unexpected_keys = []
+        shape_mismatched_keys = []
+        for key, value in state_dict.items():
+            if key not in model_state:
+                unexpected_keys.append(key)
+                continue
+            checkpoint_shape = _shape_tuple(value)
+            model_shape = _shape_tuple(model_state[key])
+            if checkpoint_shape != model_shape:
+                shape_mismatched_keys.append(
+                    {
+                        "key": key,
+                        "checkpoint_shape": checkpoint_shape,
+                        "model_shape": model_shape,
+                    }
+                )
+                continue
+            filtered_state_dict[key] = value
+        state_dict = filtered_state_dict
+        report["unexpected_keys"] = unexpected_keys
+        report["shape_mismatched_keys"] = shape_mismatched_keys
+
+    incompatible = model.load_state_dict(state_dict, strict=strict)
+    if not strict:
+        shape_mismatched_key_names = {
+            item["key"] for item in report["shape_mismatched_keys"]
+        }
+        report["missing_keys"] = [
+            key for key in incompatible.missing_keys
+            if key not in shape_mismatched_key_names
+        ]
+        # Preserve unexpected keys found before filtering. PyTorch will not see
+        # them after filtering, but they are important diagnostics for callers.
+        report["unexpected_keys"].extend(
+            key for key in incompatible.unexpected_keys
+            if key not in report["unexpected_keys"]
+        )
     if eval_phase:
         model.eval()
     else:
         model.train()
+    return report
 
 
 class ModelSaver:

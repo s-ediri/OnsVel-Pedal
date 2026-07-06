@@ -1,4 +1,41 @@
-# Training Guide: 3-5 Day Pedal-Aware Training
+# Training Guide: Pedal-Specialized Training Without Hurting Note F1
+
+This project now treats sustain-pedal learning as a **pedal-head fine-tuning**
+task by default. The bundled note checkpoint already has high onset/velocity
+performance, so the safest workflow is to freeze the note backbone and train
+only the newly added pedal head.
+
+## Recommended Command
+
+From the repository root:
+
+```bash
+conda activate onsvel
+
+# Optional but recommended if recent experimental checkpoints degraded note F1.
+# On Windows cmd, use: del out\model_snapshots\.resume_state.json
+rm -f out/model_snapshots/.resume_state.json
+
+python scripts/02_train_pedal_model.py \
+  PEDAL_ONLY_FINETUNE=true \
+  RESUME_FROM_LATEST=false \
+  PEDAL_LR_MAX=0.0003 \
+  TRAIN_BATCH_SECS=4.0 \
+  NUM_EPOCHS=8
+```
+
+Expected safety properties:
+
+- `specnorm`, `stem`, `onset_stages`, and `velocity_stage` are frozen.
+- Pedal features are detached before the pedal loss.
+- Onset/velocity losses appear under `note_monitor_losses`, not optimized `losses`, in pedal-only mode.
+- The optimizer uses `PEDAL_LR_MAX`, not the larger full-model `LR_MAX`.
+- The script refuses to run pedal-only fine-tuning without a valid note checkpoint; this prevents freezing a random note model.
+
+Avoid `RESUME_FROM_LATEST=true` unless you are certain the latest checkpoint was
+also produced by the safe pedal-only workflow. If recent agentic/code-assisted
+runs lowered note F1, start again from the bundled baseline by leaving
+`SNAPSHOT_INPATH` unset and `RESUME_FROM_LATEST=false`.
 
 ## Configuration Changes
 
@@ -10,7 +47,9 @@
 | `NUM_EPOCHS` | **2** | **8** | More epochs = better learning |
 | `ONSET_POSITIVES_WEIGHT` | 2.0 | **3.0** | Onsets are sparse, need higher weight |
 | `PEDAL_LOSS_LAMBDA` | 0.5 | **1.0** | Pedal detection is important |
-| `PEDAL_POSITIVES_WEIGHT` | 2.0 | **3.0** | Pedal events are also sparse |
+| `PEDAL_POSITIVES_WEIGHT` | 2.0 | **2.0** | Pedal-active frames are weighted without overpowering training |
+| `PEDAL_LR_MAX` | N/A | **0.0003** | Stable pedal-head-only fine-tuning |
+| `TRAINABLE_ONSETS` | `true` | **`false`** | Do not update note layers during pedal specialization |
 | `TRAIN_LOG_EVERY` | 10 | **50** | Reduce logging overhead |
 
 ---
@@ -43,48 +82,55 @@
 
 ### Step 1: Clean Start (Recommended)
 ```bash
-# Backup old checkpoint
-mv out/model_snapshots/OnsetsAndVelocities_2026_01_30_12_46_23.207.torch out/model_snapshots/old_prototype.torch
-
-# Remove resume state (start fresh)
-rm out/model_snapshots/.resume_state.json
+# Remove resume state so the run starts from the bundled high-F1 note baseline.
+rm -f out/model_snapshots/.resume_state.json
 
 # Activate environment
 conda activate onsvel
 
-# Start training
-python scripts/02_train_pedal_model.py
+# Start safe pedal-only training
+python scripts/02_train_pedal_model.py RESUME_FROM_LATEST=false PEDAL_ONLY_FINETUNE=true
 ```
 
 ### Step 2: Monitor Progress
 Watch the console output:
 ```
 [TRAIN] epoch: 1, step: 50, global_step: 50
-  losses: {vel: 0.234, pedal: 0.187, ons: 0.456}
-  LR: 0.00412
+  losses: {pedal: 0.18}
+  note_monitor_losses: {vel: ..., ons: ...}
+  loss_mode: pedal_only_note_losses_are_monitoring_only
+  LR: 0.00027
 ```
 
 **What to look for:**
-- Losses should gradually decrease
-- After ~1000 steps, losses should stabilize around:
-  - **onset loss:** 0.2-0.4
-  - **velocity loss:** 0.1-0.3
-  - **pedal loss:** 0.1-0.3
+- **Pedal loss** should gradually decrease.
+- **Onset/velocity monitor losses** should remain roughly stable because those layers are frozen; they are logged only as a regression monitor and are not part of the optimized loss.
+- If note evaluation F1 drops after this workflow, suspect checkpoint selection/evaluation thresholding rather than pedal training updates, because note parameters are frozen.
+
+If `note_monitor_losses.ons` is extremely high at the start, first check that a
+real note checkpoint was loaded. Freezing a random onset backbone will produce
+large monitor losses and poor note F1. The default baseline path is:
+
+```text
+out/model_snapshots/OnsetsAndVelocities_2023_03_04_09_53_53.289step=43500_f1=0.9675__0.9480.torch
+```
 
 ---
 
 ## 📈 **Expected Results**
 
-### After 8 Epochs:
-- **Onset F1:** ~0.85-0.92 (good)
-- **Onset+Velocity F1:** ~0.80-0.88 (good)
-- **Predictions per file:** 2,000-5,000 (reasonable, not 500k!)
+### After Pedal-Only Fine-Tuning:
+- **Onset F1 / Onset+Velocity F1:** should remain close to the loaded note checkpoint after threshold search.
+- **Sustain-pedal F1:** should improve compared with the untrained/random pedal head.
+- **Predictions per file:** should remain reasonable for notes because note logits are preserved.
 
 ### Compared to Original Paper (15 epochs, no pedal):
 - **Onset F1:** ~0.967 (reference)
 - **Onset+Velocity F1:** ~0.945 (reference)
 
-Your model with 8 epochs should get **~90% of paper performance**, which is excellent for your use case.
+Because the note backbone is frozen, the goal is not to relearn note detection;
+it is to preserve the checkpoint’s note performance while adding usable pedal
+predictions.
 
 ---
 
@@ -107,13 +153,14 @@ Your model with 8 epochs should get **~90% of paper performance**, which is exce
 - Not so many that it overfits
 - Finishes in ~10-12 hours
 
-### 3. **Higher Loss Weights**
-**Old problem:** Onsets and pedals are rare events, model ignores them
+### 3. **Frozen Note Backbone + Small Pedal LR**
+**Old problem:** pedal loss was introduced into a workflow that could update or resume from degraded note checkpoints, so onset/velocity F-score suffered.
 
 **Solution:**
-- `ONSET_POSITIVES_WEIGHT: 3.0` - Forces model to pay attention to onsets
-- `PEDAL_POSITIVES_WEIGHT: 3.0` - Forces model to detect pedal events
-- `PEDAL_LOSS_LAMBDA: 1.0` - Makes pedal detection important
+- `PEDAL_ONLY_FINETUNE=true` freezes note layers.
+- `DETACH_PEDAL_FEATURES=true` prevents pedal gradients from touching shared features.
+- `PEDAL_LR_MAX=0.0003` avoids unstable updates in the new pedal head.
+- `MAX_GRAD_NORM=1.0` clips occasional transition-heavy gradient spikes.
 
 ---
 
@@ -127,7 +174,15 @@ out/model_snapshots/
 └── ...
 ```
 
-**Use the LATEST checkpoint for evaluation.**
+**Use the latest checkpoint only if it came from the safe pedal-only workflow.**
+If you have mixed older experimental checkpoints in `out/model_snapshots`, pass the
+exact checkpoint path to evaluation instead of relying on “latest”.
+
+Checkpoint artifact policy:
+- `.torch` checkpoints are generated binary artifacts and are ignored by Git.
+- Do **not** commit new checkpoints directly and do **not** add them to Git LFS for normal development.
+- To share a selected trained model, upload it as a versioned GitHub/GitLab release asset or another documented download artifact, then document the download URL, expected filename/path, and any relevant metric/checksum metadata.
+- Keep local training outputs under `out/model_snapshots/`; copy or download a shared checkpoint there when running evaluation locally.
 
 ---
 
@@ -148,11 +203,12 @@ python scripts/05_analyze_training_logs.py LOG_PATH="out/txt_logs/YOUR_LOG.json"
 
 ## ⚠️ **If Training Stops/Crashes**
 
-The training script **auto-resumes** from the latest checkpoint:
+The training script only auto-resumes from the latest generated checkpoint when
+you explicitly set `RESUME_FROM_LATEST=true`:
 
 ```bash
-# Just restart - it will continue where it left off
-python scripts/02_train_pedal_model.py
+# Continue a known-good pedal-only run
+python scripts/02_train_pedal_model.py RESUME_FROM_LATEST=true
 ```
 
 **Resume state saved every 500 steps in:**
@@ -219,11 +275,11 @@ python scripts/02_train_pedal_model.py TRAIN_BATCH_SECS=5.0
 
 **New Config:**
 - 4-second chunks
-- 8 epochs
-- Result: Proper onset detection with reasonable predictions
+- 8 epochs of pedal-head-only fine-tuning
+- Result: Preserved onset/velocity predictions plus trained sustain-pedal output
 - Time: **10-12 hours (< 2 days)**
 
-**Your model will be properly trained and ready to use!** 🎹🎶
+**Your pedal head will be specialized while the high-F1 note model is protected.** 🎹🎶
 
 ---
 
@@ -231,7 +287,7 @@ python scripts/02_train_pedal_model.py TRAIN_BATCH_SECS=5.0
 
 ```bash
 conda activate onsvel
-python scripts/train.py
+python scripts/02_train_pedal_model.py RESUME_FROM_LATEST=false PEDAL_ONLY_FINETUNE=true
 ```
 
 **The training will complete in 1-2 days, well within your 3-5 day target!**

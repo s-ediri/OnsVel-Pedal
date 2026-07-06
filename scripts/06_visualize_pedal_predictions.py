@@ -13,18 +13,17 @@ from typing import Optional, List
 #
 from omegaconf import OmegaConf
 import torch
-import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 #
 from ov_piano import PIANO_MIDI_RANGE, HDF5PathManager
-from ov_piano.utils import load_model
+from ov_piano.utils import format_load_model_warnings, load_model
 from ov_piano.custom_logging import ColorLogger
 from ov_piano.data.maestro import MetaMAESTROv1, MetaMAESTROv2, MetaMAESTROv3
 from ov_piano.data.maestro import MelMaestro
 from ov_piano.models.ov import OnsetsAndVelocities
-from ov_piano.inference import strided_inference, PedalDecoder
+from ov_piano.inference import strided_inference, model_outputs_to_probabilities
 from ov_piano.eval import GtLoaderMaestro
 
 
@@ -168,7 +167,7 @@ class ConfDef:
     INFERENCE_CHUNK_OVERLAP: float = 11
     INFERENCE_THRESHOLD: float = 0.74
     #
-    CONV1X1: List[int] = (128, 128)
+    CONV1X1: List[int] = (200, 200)
     LEAKY_RELU_SLOPE: float = 0.1
     #
     OUTPUT_DIR: Optional[str] = None  # "assets/plots"
@@ -251,12 +250,12 @@ if __name__ == "__main__":
         leaky_relu_slope=CONF.LEAKY_RELU_SLOPE,
         dropout_drop_p=0).to(CONF.DEVICE)
     if CONF.SNAPSHOT_INPATH is not None:
-        load_model(
-            model, CONF.SNAPSHOT_INPATH, eval_phase=True, to_cpu=True)
+        load_report = load_model(
+            model, CONF.SNAPSHOT_INPATH, eval_phase=True, to_cpu=True,
+            strict=False)
+        for warning in format_load_model_warnings(load_report):
+            txt_logger.warning(f"CHECKPOINT LOAD WARNING: {warning}")
     
-    # Create pedal decoder for single sustain pedal
-    pedal_decoder = PedalDecoder(num_pedals=1, threshold=0.5)
-
     ##############
     # INFERENCE
     ##############
@@ -265,17 +264,7 @@ if __name__ == "__main__":
         Convenience wrapper around DNN to ensure output and input sequences
         have same length.
         """
-        probs, vels, pedals = model(x)  # Include pedal predictions
-        probs = F.pad(torch.sigmoid(probs[-1]), (1, 0))
-        vels = F.pad(torch.sigmoid(vels), (1, 0))
-        # Ensure pedal shape is (b, 1, t) for decoder
-        pedals = pedals.squeeze()  # Remove extra dims
-        if len(pedals.shape) == 1:
-            pedals = pedals.unsqueeze(0).unsqueeze(0)  # (1, 1, t)
-        elif len(pedals.shape) == 2:
-            pedals = pedals.unsqueeze(1)  # (b, 1, t)
-        pedals = F.pad(torch.sigmoid(pedals), (1, 0))
-        return probs, vels, pedals
+        return model_outputs_to_probabilities(model(x), include_pedals=True)
 
     test_results = []
     test_results_vel = []
@@ -289,8 +278,6 @@ if __name__ == "__main__":
             tmel = torch.from_numpy(mel).to(CONF.DEVICE).unsqueeze(0)
             onset_pred, vel_pred, pedal_pred = strided_inference(
                 model_inference, tmel, CHUNK_SIZE, CHUNK_OVERLAP)
-            # Process pedal predictions
-            pedal_events = pedal_decoder(pedal_pred)
             onset_pred = onset_pred.cpu().numpy().squeeze()
             vel_pred = vel_pred.cpu().numpy().squeeze()
 

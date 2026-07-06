@@ -2,12 +2,17 @@
 datasets/*
 # if symlink
 datasets
+# Model checkpoints are generated binary artifacts. Keep them out of Git;
+# publish selected checkpoints as release/download artifacts instead.
+*.torch
 assets/model_snapshots/*
 assets/test_output/*
 out/*
 uploads/*
 .claude
-_archived_files
+_archived_files/*
+!_archived_files/debug_scripts/
+!_archived_files/debug_scripts/*.py
 .gcp
 .cline
 .clinerules
@@ -141,5 +146,3 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
-
-

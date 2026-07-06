@@ -11,12 +11,17 @@ piano roll representation, making use of functionality implemented in the
 
 
 from collections import defaultdict, OrderedDict
+import logging
+import warnings
 #
 import mido
 import numpy as np
 import pandas as pd
 #
 from .key_model import KeyboardStateMachine
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 # ##############################################################################
@@ -45,8 +50,11 @@ class SingletrackMidiParser:
         :returns: ``mido.MidiFile`` instance with the loaded file.
         """
         mid = mido.MidiFile(midi_path)
-        assert mid.type == cls.SINGLETRACK_MIDI_CODE, \
-            "Only single-track MIDI files expected!"
+        if mid.type != cls.SINGLETRACK_MIDI_CODE:
+            raise ValueError(
+                "Only single-track MIDI files expected; "
+                f"got MIDI type {mid.type} for {midi_path!r}."
+            )
         return mid
 
     @classmethod
@@ -62,10 +70,24 @@ class SingletrackMidiParser:
         if msg.type in ("note_on", "note_off"):
             return (msg.type, (msg.note, msg.velocity), msg.channel)
         elif msg.type == "control_change":
-            msg_name = cls.CONTROL_CODES[msg.control]
+            msg_name = cls.CONTROL_CODES.get(msg.control)
+            if msg_name is None:
+                warnings.warn(
+                    "Ignoring unsupported MIDI control_change "
+                    f"control={msg.control}, value={msg.value}, "
+                    f"channel={msg.channel}.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                return None
             return (msg_name, msg.value, msg.channel)
         else:
-            raise RuntimeError(f"Unhandled message! {msg}")
+            warnings.warn(
+                f"Ignoring unsupported MIDI message type {msg.type!r}: {msg}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return None
 
     @classmethod
     def parse_midi(cls, midi_file):
@@ -80,9 +102,15 @@ class SingletrackMidiParser:
         information from each message and also converting the timestamps to
         global frame, in seconds.
         """
-        assert len(midi_file.tracks) == 1, "Only single-track MIDI supported!"
+        if len(midi_file.tracks) != 1:
+            raise ValueError(
+                "Only single-track MIDI supported by SingletrackMidiParser; "
+                f"got {len(midi_file.tracks)} tracks. Use MaestroMidiParser "
+                "for supported MAESTRO type-1 files."
+            )
         tpb = midi_file.ticks_per_beat  # given in file
         tempo = cls.DEFAULT_MIDI_TEMPO
+        saw_tempo = False
         seconds_counter = 0
         messages = []
         meta_messages = []
@@ -94,21 +122,39 @@ class SingletrackMidiParser:
             # if message is not meta: simply gather
             if not msg.is_meta:
                 msg_data = cls.dispatch_msg(msg)
-                messages.append((seconds_counter, msg_data))
+                if msg_data is not None:
+                    messages.append((seconds_counter, msg_data))
             # meta messages may require special handling
             else:
-                meta_messages.append((seconds_counter, msg))
                 if msg.type == "set_tempo":
+                    meta_messages.append((seconds_counter, msg))
+                    saw_tempo = True
                     tempo = msg.tempo
                 elif msg.type == "end_of_track":
+                    meta_messages.append((seconds_counter, msg))
                     pass
                 else:
-                    raise RuntimeError(
-                        f"Unhandled MIDI meta-message?: {msg.type}")
-        assert msg.type == "end_of_track", "Last message must be end_of_track!"
-        assert np.isclose(midi_file.length, meta_messages[-1][0]), \
-            "MIDI length should equal end_of_track timestamp! " + \
-            f"{(midi_file.length, meta_messages[-1][0])}"
+                    warnings.warn(
+                        f"Ignoring unsupported MIDI meta-message {msg.type!r}: {msg}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+        if not meta_messages or meta_messages[-1][1].type != "end_of_track":
+            raise ValueError("Last MIDI message must be end_of_track.")
+        if not saw_tempo:
+            warnings.warn(
+                "MIDI file has no set_tempo meta-message; assuming the MIDI "
+                f"standard default tempo {cls.DEFAULT_MIDI_TEMPO} us/beat "
+                "(120 BPM).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if not np.isclose(midi_file.length, meta_messages[-1][0]):
+            raise ValueError(
+                "MIDI length should equal end_of_track timestamp; "
+                f"got length={midi_file.length}, "
+                f"end_of_track_ts={meta_messages[-1][0]}."
+            )
         return messages, meta_messages
 
     @staticmethod
@@ -131,7 +177,12 @@ class SingletrackMidiParser:
         sounding = []
 
         msgs_ts = [ts for ts, _ in msgs]
-        assert msgs_ts == sorted(msgs_ts), "msgs expected to be sorted by ts!"
+        if msgs_ts != sorted(msgs_ts):
+            raise ValueError("MIDI messages expected to be sorted by timestamp.")
+        if not msgs:
+            empty_events = pd.DataFrame(columns=("onset", "offset", "key", "vel"))
+            empty_states = pd.DataFrame(columns=["ts", "val"])
+            return empty_events, empty_states.copy(), empty_states.copy(), empty_states.copy(), 0
         for ts, m in msgs:
             m_type = m[0]
             if m_type == "sustain_pedal":
@@ -165,8 +216,12 @@ class SingletrackMidiParser:
         last_sounding = len(sounding[-1][1])
         all_onsets = sum([len(x) for _, x in onsets])
         all_offsets = sum([len(x) for _, x in offsets])
-        assert all_onsets == (all_offsets + last_sounding), \
-            "Mismatching number of onsets and offsets+sounding notes!"
+        if all_onsets != (all_offsets + last_sounding):
+            raise ValueError(
+                "Mismatching number of note onsets and offsets+sounding notes: "
+                f"onsets={all_onsets}, offsets={all_offsets}, "
+                f"last_sounding={last_sounding}."
+            )
 
         # unfortunately, MAPS seems to have simultaneous pedal events with
         # different values. we handle this by picking the last one and ignoring
@@ -174,12 +229,12 @@ class SingletrackMidiParser:
         sus_states = [(k, v) for k, v in OrderedDict(sus_states).items()]
         ten_states = [(k, v) for k, v in OrderedDict(ten_states).items()]
         soft_states = [(k, v) for k, v in OrderedDict(soft_states).items()]
-        assert len(sus_states) == len(dict(sus_states)), \
-            "Simultaneous sus pedal events not allowed!"
-        assert len(ten_states) == len(dict(ten_states)), \
-            "Simultaneous ten pedal events not allowed!"
-        assert len(soft_states) == len(dict(soft_states)), \
-            "Simultaneous soft pedal events not allowed!"
+        if len(sus_states) != len(dict(sus_states)):
+            raise ValueError("Simultaneous sustain pedal events not allowed.")
+        if len(ten_states) != len(dict(ten_states)):
+            raise ValueError("Simultaneous sostenuto pedal events not allowed.")
+        if len(soft_states) != len(dict(soft_states)):
+            raise ValueError("Simultaneous soft pedal events not allowed.")
 
         # we can't have 2 simultaneous same-key onsets or offsets
         onsets_check = defaultdict(list)
@@ -188,20 +243,26 @@ class SingletrackMidiParser:
             onsets_check[k].extend(v.keys())
         for k, v in offsets:
             offsets_check[k].extend(v.keys())
-        assert all([len(v) == len(set(v)) for v in onsets_check.values()]), \
-            "Simultaneous same-key onsets not allowed!"
-        assert all([len(v) == len(set(v)) for v in offsets_check.values()]), \
-            "Simultaneous same-key offsets not allowed!"
+        if not all([len(v) == len(set(v)) for v in onsets_check.values()]):
+            raise ValueError("Simultaneous same-key note onsets not allowed.")
+        if not all([len(v) == len(set(v)) for v in offsets_check.values()]):
+            raise ValueError("Simultaneous same-key note offsets not allowed.")
         # at this point, no downpressed notes are expected, but some resonant
         # notes may be left
-        assert not ksm()[0], "Notes left downpressed at end of MIDI?"
+        if ksm()[0]:
+            raise ValueError(
+                "Notes left downpressed at end of MIDI: "
+                f"{sorted(ksm()[0].keys())}."
+            )
 
         # handle resonant leftovers by adding them to offsets
         largest_ts = max(
-            offsets[-1][0],  # simply find largest timestamp
-            max(sus_states[-1:], key=lambda elt: elt[0], default=[-1])[0],
-            max(sus_states[-1:], key=lambda elt: elt[0], default=[-1])[0],
-            max(sus_states[-1:], key=lambda elt: elt[0], default=[-1])[0])
+            max(msgs_ts, default=0),
+            max([ts for ts, _ in offsets], default=0),
+            max([ts for ts, _ in sus_states], default=0),
+            max([ts for ts, _ in ten_states], default=0),
+            max([ts for ts, _ in soft_states], default=0),
+        )
         for ke in ksm()[1].values():
             ke.offset_ts = largest_ts
         offsets.append((largest_ts, ksm()[1].copy()))
@@ -318,16 +379,26 @@ class MidiToPianoRoll:
         """
         # Check that all messages are on channel 0 (single-instrument)
         msg_channels = [x[1][-1] for x in msgs]
-        assert all(x == msg_channels[0] for x in msg_channels), \
-            "Only single-channel MIDI supported!"
+        if msg_channels and not all(x == msg_channels[0] for x in msg_channels):
+            raise ValueError(
+                "Only single-channel MIDI supported; observed channels "
+                f"{sorted(set(msg_channels))}."
+            )
         # Check that meta messages are simply set tempo at beginning and
         # end of track at end
-        assert len(meta_msgs) == 2, \
-            "Expected only 2 meta msgs. If multiple tempo changes, fix this!"
-        assert meta_msgs[0][1].type == "set_tempo", \
-            "First meta message expected is set_tempo"
-        assert meta_msgs[1][1].type == "end_of_track", \
-            "Second meta message expected is end_of_track"
+        meta_types = [msg.type for _, msg in meta_msgs]
+        tempo_count = meta_types.count("set_tempo")
+        if tempo_count > 1:
+            raise ValueError(
+                "Multiple tempo changes are not supported by MidiToPianoRoll; "
+                f"observed meta message sequence {meta_types}."
+            )
+        if meta_types not in (["set_tempo", "end_of_track"], ["end_of_track"]):
+            raise ValueError(
+                "Expected MIDI meta messages to be [set_tempo, end_of_track] "
+                "or [end_of_track] when default tempo is assumed; observed "
+                f"{meta_types}."
+            )
 
     @classmethod
     def __call__(cls, midi_path,
@@ -416,11 +487,17 @@ class MidiToPianoRoll:
             is_collision = ((onset_roll[key, beg] != 0) or
                             (offset_roll[key, end] != 0))
             if is_collision:
-                print("WARNING: onset/offset collision. To avoid this,",
-                      "increase time-quant resolution:", (beg, end, key, vel))
+                LOGGER.warning(
+                    "onset/offset collision. To avoid this, increase "
+                    "time-quant resolution: %s",
+                    (beg, end, key, vel),
+                )
             if is_collision:
-                print("WARNING: beg==end, note ignored. To avoid this,",
-                      "increase time-quant resolution:", (beg, end, key, vel))
+                LOGGER.warning(
+                    "beg==end, note ignored. To avoid this, increase "
+                    "time-quant resolution: %s",
+                    (beg, end, key, vel),
+                )
             onset_roll[key, beg] = vel
             offset_roll[key, end] = vel
             frame_roll[key, beg:end] = vel

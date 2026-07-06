@@ -43,31 +43,46 @@ This is [Free/Libre and Open Source Software](https://www.gnu.org/philosophy/flo
 
 # Software dependencies
 
-We use `PyTorch`. The following instructions should allow to create a working environment from scratch, with all required dependencies (tested on `Ubuntu 20.04` with `conda 4.13.0`):
+This project uses `PyTorch` and provides a reproducible Windows Conda environment at the repository root: [`environment.yml`](../environment.yml). The environment is pinned to Python 3.9 with a CPU-only PyTorch 1.11 / torchaudio 0.11 stack so that setup and smoke tests do not depend on a local CUDA installation.
 
-```
-# create and activate conda venv
-conda create -n onsvel python==3.9
+From the repository root (`OnsVel-Pedal`), create and validate the environment with:
+
+```bash
+conda env create -f environment.yml
 conda activate onsvel
-
-# conda dependencies
-conda install pytorch==1.11.0 torchaudio==0.11.0 -c pytorch
-conda install pandas==1.4.2 -c anaconda
-conda install omegaconf==2.1.2 -c conda-forge
-conda install h5py==3.6.0 -c anaconda
-
-
-# pip dependencies
-pip install coloredlogs==15.0.1
-pip install mido==1.2.10
-pip install mir-eval==0.7
-pip install parse==1.19.0
-
-# optional
-conda install matplotlib==3.7.1 -c conda-forge
+python -m pytest tests -q
 ```
 
-See the full [requirements](requirements.txt) for a comprehensive description of the resulting environment.
+If the environment already exists and `environment.yml` changes, update it with:
+
+```bash
+conda env update -f environment.yml --prune
+conda activate onsvel
+python -m pytest tests -q
+```
+
+For the most reproducible reset, especially after experimenting with `pip install` inside `onsvel`, remove and recreate the environment instead of updating it in place:
+
+```bash
+conda env remove -n onsvel
+conda env create -f environment.yml
+conda activate onsvel
+python -m pytest tests -q
+```
+
+The fallback [`requirements.txt`](../requirements.txt) remains available for pip-only workflows, but the Conda file is the recommended setup path on Windows because it manages PyTorch and scientific binary dependencies consistently.
+
+Audio upload decoding uses `pydub` plus `ffmpeg` for MP3 and other non-WAV formats. The Conda environment installs `ffmpeg` for you. If you run a pip-only setup on Python 3.13 or newer and see `No module named 'pyaudioop'`, install the Python 3.13 `audioop` compatibility package with `python -m pip install audioop-lts`, or switch back to the supported `onsvel` Conda environment.
+
+`environment.yml` installs this project in editable mode (`-e .`) after the pinned Conda packages are present. That keeps direct commands such as `python scripts/03_evaluate_pedal_model.py` working from the repository root and lets local source edits take effect immediately. If you later need to refresh only the editable project install, activate `onsvel` and use:
+
+```bash
+python -m pip install --no-deps --no-build-isolation -e .
+```
+
+Avoid ad-hoc `pip install --upgrade ...` commands inside `onsvel`; they can leave pip-installed packages that `conda env update --prune` may not downgrade. Use the clean reset commands above whenever you need to return to the pinned environment.
+
+> **GPU training note:** `environment.yml` intentionally uses `cpuonly` for reproducible setup and testing. For CUDA training, replace `cpuonly` with the PyTorch CUDA package that matches your Windows GPU driver, then run `conda env update -f environment.yml --prune`.
 
 
 
@@ -181,12 +196,14 @@ Processing `MAPS` with the default settings takes about 20min on a 16-core CPU. 
 
 # Running and evaluating the pedal-aware model
 
-This repository includes support for evaluating a pretrained model checkpoint such as [assets/OnsetsAndVelocities_2023_03_04_09_53_53.289step=43500_f1=0.9675__0.9480.torch](assets/OnsetsAndVelocities_2023_03_04_09_53_53.289step=43500_f1=0.9675__0.9480.torch). The evaluation script can be run with default parameters as follows:
+This repository supports evaluating trained `.torch` model checkpoints. Checkpoints are binary artifacts and should be treated as release/download artifacts, not regular source files: new `.torch` files are ignored by Git, should not be committed directly, and should not be moved to Git LFS for normal development. To share a selected pretrained model, publish it as a versioned release asset or another documented download, then record the URL, expected local path, and checksum/metric metadata.
+
+Place a downloaded or locally trained checkpoint under `out/model_snapshots/` and evaluate it with:
 
 
 
 ```
-python scripts/03_evaluate_pedal_model.py SNAPSHOT_INPATH=assets/OnsetsAndVelocities_2023_03_04_09_53_53.289step=43500_f1=0.9675__0.9480.torch
+python scripts/03_evaluate_pedal_model.py SNAPSHOT_INPATH=out/model_snapshots/YOUR_MODEL.torch
 ```
 
 Yielding the following results after a few minutes:
@@ -280,5 +297,5 @@ The qualitative plot used in the [paper](https://arxiv.org/abs/2303.04485) can b
 
 
 ```
-python scripts/06_visualize_pedal_predictions.py SNAPSHOT_INPATH=assets/OnsetsAndVelocities_2023_03_04_09_53_53.289step\=43500_f1\=0.9675__0.9480.torch OUTPUT_DIR=out
+python scripts/06_visualize_pedal_predictions.py SNAPSHOT_INPATH=out/model_snapshots/YOUR_MODEL.torch OUTPUT_DIR=out
 ```

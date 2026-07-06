@@ -12,6 +12,8 @@ and then pressed again without being released this leads to an inconsistent
 state).
 """
 
+import warnings
+
 
 # ##############################################################################
 # # KEY EVENT
@@ -204,7 +206,11 @@ class KeyboardStateMachine:
                 err_msg = f"Pressing a pressed key: {key}"
                 if self.ignore_redundant_keypress:
                     # in this case, "lift" preexisting key and print a warning
-                    print(f"WARNING: {err_msg}. Simulating lifting...")
+                    warnings.warn(
+                        f"{err_msg}. Simulating lifting before repeated onset.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
                     end_ts = timestamp - self.pre_lifting_epsilon
                     lifted = self.key_lifted(key, timestamp=end_ts)
                     offsets.update(lifted)
@@ -235,7 +241,11 @@ class KeyboardStateMachine:
                 # this triggers an exception, or a warning
                 err_msg = f"Lifted key wasn't downpressed! {key}"
                 if self.ignore_redundant_keylift:
-                    print(f"WARNING: {err_msg}. Ignoring...")
+                    warnings.warn(
+                        f"{err_msg}. Ignoring redundant note-off.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
                     continue  # do not handle this key further
                 else:
                     raise RuntimeError(err_msg)

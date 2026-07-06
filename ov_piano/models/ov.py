@@ -155,15 +155,22 @@ class OnsetsAndVelocities(torch.nn.Module):
                     self.VSTAGE_CAM_DILATIONS, self.VSTAGE_CAM_PADDINGS,
                     bn_momentum, leaky_relu_slope, dropout_drop_p),
             SubSpectralNorm(1, out_height, out_height, bn_momentum))
-        
-        # Add pedal detection stage (sustain pedal only)
+        # Lightweight sustain-pedal head. Pedal state is global, so collapse the
+        # key axis once instead of running another per-key CAM stack. This keeps
+        # pedal learning separate and avoids adding unnecessary capacity that can
+        # compete with onset/velocity training.
+        pedal_hidden = min(64, max(16, conv1x1head[0] // 4))
         self.pedal_stage = torch.nn.Sequential(
-            self.get_cam_stage(
-                    vel_in_chans, 1, conv1x1head,
-                    self.VSTAGE_NUM_CAMS, self.VSTAGE_CAM_HDC_CHANS,
-                    self.VSTAGE_CAM_SE_BOTTLENECK, self.VSTAGE_CAM_KSIZES,
-                    self.VSTAGE_CAM_DILATIONS, self.VSTAGE_CAM_PADDINGS,
-                    bn_momentum, leaky_relu_slope, dropout_drop_p))
+            torch.nn.Conv2d(vel_in_chans, pedal_hidden, (out_height, 1),
+                            bias=False),
+            torch.nn.BatchNorm2d(pedal_hidden, momentum=bn_momentum),
+            get_relu(leaky_relu_slope),
+            torch.nn.Conv2d(pedal_hidden, pedal_hidden, (1, 5),
+                            padding=(0, 2), bias=False),
+            torch.nn.BatchNorm2d(pedal_hidden, momentum=bn_momentum),
+            get_relu(leaky_relu_slope),
+            torch.nn.Dropout2d(dropout_drop_p),
+            torch.nn.Conv2d(pedal_hidden, 1, (1, 1)))
 
         # initialize parameters
         if init_fn is not None:
@@ -209,13 +216,22 @@ class OnsetsAndVelocities(torch.nn.Module):
         #
         return x_stages, stem_out
 
+    def forward_pedals(self, features):
+        """
+        Predict the global sustain-pedal state from note-aligned features.
+
+        :param features: Tensor of shape ``(b, stem_chans + 1, keys, t)``.
+        :returns: Tensor of shape ``(b, 1, t)``.
+        """
+        return self.pedal_stage(features).squeeze(2)
+
     def forward(self, x, trainable_onsets=True):
         """
         :param x: Logmel batch of shape ``(b, melbins, t)``
         :returns: ``(x_stages, velocities, pedals)``. See ``forward_onsets`` for
           a description of ``x_stages``. The ``velocities`` tensor has shape
           ``(b, keys, t-1)``, and ``pedals`` tensor has shape ``(b, 1, t-1)``
-          for the sustain pedal (averaged across keys).
+          for the global sustain pedal.
         """
         if trainable_onsets:
             x_stages, stem_out = self.forward_onsets(x)
@@ -227,8 +243,6 @@ class OnsetsAndVelocities(torch.nn.Module):
                                      dim=1)
         #
         velocities = self.velocity_stage(stem_out).squeeze(1)  # (b, out_height, t)
-        pedals_per_key = self.pedal_stage(stem_out).squeeze(1)  # (b, out_height, t) - per-key pedal predictions
-        # Average across keys to get single pedal signal: (b, out_height, t) -> (b, 1, t)
-        pedals = pedals_per_key.mean(dim=1, keepdim=True).squeeze(2)
+        pedals = self.forward_pedals(stem_out)
         #
         return x_stages, velocities, pedals

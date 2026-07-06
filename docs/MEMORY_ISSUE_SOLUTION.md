@@ -148,9 +148,14 @@ Possible causes:
 
 ### Before Running Evaluation:
 ```bash
-# Make sure using high enough threshold
-python scripts/03_evaluate_pedal_model.py SEARCH_THRESHOLDS="[0.80]"
+# Memory-safe diagnostic run. Do not report these metrics as final.
+python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=low_memory
+
+# Final/reportable run after diagnostics pass.
+python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=full
 ```
+
+`quick` and `low_memory` shorten the validation split for speed/memory safety. They are useful for debugging OOM problems, but final metrics must come from `EVALUATION_PRESET=full` or another run with `XV_TAKE_ONE_EVERY=1`.
 
 ### Monitor Output:
 Watch for these log messages:
@@ -161,17 +166,17 @@ Watch for these log messages:
 ### If Still Out of Memory:
 1. **Increase threshold further:**
    ```bash
-   python scripts/03_evaluate_pedal_model.py SEARCH_THRESHOLDS="[0.85]"
+   python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=low_memory SEARCH_THRESHOLDS="[0.85]"
    ```
 
 2. **Process even fewer validation files:**
    ```bash
-   python scripts/03_evaluate_pedal_model.py XV_TAKE_ONE_EVERY=50
+   python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=quick
    ```
 
 3. **Lower the safety limit** (if needed):
    ```bash
-   python scripts/03_evaluate_pedal_model.py MAX_PREDICTIONS_PER_FILE=20000
+   python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=low_memory MAX_PREDICTIONS_PER_FILE=20000
    ```
 
 ---

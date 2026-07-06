@@ -59,7 +59,18 @@
                 <div class="results-controls">
                     <button id="play-btn" class="button">Play Transcription</button>
                 </div>
-                <div id="sheet-music-container"></div>
+                <section class="notation-preview" aria-labelledby="notation-preview-title">
+                    <div class="notation-preview-header">
+                        <h3 id="notation-preview-title">Approximate pitch preview</h3>
+                        <span class="preview-badge">Not a score/export</span>
+                    </div>
+                    <p class="preview-disclaimer">
+                        This view is an approximate, unquantized pitch sketch generated from detected note onsets.
+                        It does not infer key signature, meter, rests, voices, hands, chords, or true note durations.
+                        Use the piano roll and playback for timing-oriented review.
+                    </p>
+                    <div id="notation-preview-container"></div>
+                </section>
                 <div class="visualization">
                     <canvas id="piano-roll-canvas" width="1000" height="400"></canvas>
                 </div>

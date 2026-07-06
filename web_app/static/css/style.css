@@ -199,20 +199,80 @@ main {
 .visualization {
     width: 100%;
     overflow-x: auto;
+    position: relative;
     border: 1px solid var(--border-color);
     border-radius: var(--border-radius);
     margin-bottom: 1rem;
     background-color: #fff;
+    height: 400px;
 }
 
-#sheet-music-container {
+#piano-roll-canvas {
+    position: sticky;
+    left: 0;
+    top: 0;
+    display: block;
+    z-index: 1;
+}
+
+.piano-roll-spacer {
+    pointer-events: none;
+    visibility: hidden;
+}
+
+.notation-preview {
     width: 100%;
-    overflow-x: auto;
+    box-sizing: border-box;
     margin-bottom: 1rem;
     background: #fff;
     padding: 1rem;
     border-radius: var(--border-radius);
     border: 1px solid var(--border-color);
+}
+
+.notation-preview-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.5rem;
+}
+
+.notation-preview h3 {
+    margin: 0;
+    color: var(--text-color);
+}
+
+.preview-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.25rem 0.6rem;
+    border-radius: 999px;
+    background-color: #fff3cd;
+    color: #664d03;
+    font-size: 0.8rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.preview-disclaimer {
+    margin: 0 0 1rem;
+    color: var(--secondary-color);
+    font-size: 0.95rem;
+}
+
+#notation-preview-container {
+    width: 100%;
+    overflow-x: auto;
+}
+
+.preview-truncation-note {
+    margin: 0.75rem 0 0;
+    color: var(--secondary-color);
+    font-size: 0.85rem;
+    font-style: italic;
 }
 
 @keyframes spin {

@@ -1,7 +1,12 @@
 import torch
+import pytest
 
 from ov_piano.models.ov import OnsetsAndVelocities
-from ov_piano.inference import OnsetVelocityNmsDecoder, strided_inference
+from ov_piano.inference import (
+    OnsetVelocityNmsDecoder,
+    model_outputs_to_probabilities,
+    strided_inference,
+)
 
 
 def test_model_forward_and_decoder_smoke():
@@ -36,3 +41,85 @@ def test_strided_inference_default_overlap_is_valid():
 
     assert torch.equal(first, x)
     assert torch.equal(second, x + 1)
+
+
+def test_strided_inference_handles_uneven_final_chunk():
+    x = torch.arange(11, dtype=torch.float32).view(1, 1, 11)
+
+    def identity_model(chunk):
+        return chunk, chunk + 10
+
+    first, second = strided_inference(identity_model, x, chunk_size=4, chunk_overlap=0)
+
+    assert torch.equal(first, x)
+    assert torch.equal(second, x + 10)
+
+
+def test_strided_inference_trims_overlap_boundaries_once():
+    x = torch.arange(12, dtype=torch.float32).view(1, 1, 12)
+
+    def identity_model(chunk):
+        return chunk, -chunk
+
+    first, second = strided_inference(identity_model, x, chunk_size=6, chunk_overlap=2)
+
+    assert torch.equal(first, x)
+    assert torch.equal(second, -x)
+
+
+@pytest.mark.parametrize("bad_outputs", [None, (), []])
+def test_strided_inference_rejects_empty_or_invalid_model_outputs(bad_outputs):
+    x = torch.randn(1, 2, 5)
+
+    def bad_model(chunk):
+        return bad_outputs
+
+    with pytest.raises(AssertionError):
+        strided_inference(bad_model, x, chunk_size=4, chunk_overlap=0)
+
+
+def test_strided_inference_rejects_single_tensor_return():
+    x = torch.randn(1, 2, 5)
+
+    def single_tensor_model(chunk):
+        return chunk
+
+    with pytest.raises(AssertionError, match="list or tuple"):
+        strided_inference(single_tensor_model, x, chunk_size=4, chunk_overlap=0)
+
+
+def test_strided_inference_rejects_single_output_tuple():
+    x = torch.randn(1, 2, 5)
+
+    def single_output_model(chunk):
+        return (chunk,)
+
+    with pytest.raises(AssertionError, match="at least 2 outputs"):
+        strided_inference(single_output_model, x, chunk_size=4, chunk_overlap=0)
+
+
+def test_strided_inference_rejects_mismatched_output_time_dimensions():
+    x = torch.randn(1, 2, 5)
+
+    def mismatched_time_model(chunk):
+        return chunk[..., :-1], chunk[..., :-1]
+
+    with pytest.raises(AssertionError, match="t_outputs"):
+        strided_inference(mismatched_time_model, x, chunk_size=4, chunk_overlap=0)
+
+
+def test_model_outputs_to_probabilities_pads_with_zero_not_half():
+    onset_logits = [torch.zeros(1, 2, 3)]
+    velocity_logits = torch.zeros(1, 2, 3)
+    pedal_logits = torch.zeros(1, 1, 3)
+
+    onset_probs, velocity_probs, pedal_probs = model_outputs_to_probabilities(
+        (onset_logits, velocity_logits, pedal_logits), include_pedals=True)
+
+    assert onset_probs.shape == (1, 2, 4)
+    assert velocity_probs.shape == (1, 2, 4)
+    assert pedal_probs.shape == (1, 1, 4)
+    assert torch.equal(onset_probs[..., 0], torch.zeros_like(onset_probs[..., 0]))
+    assert torch.equal(velocity_probs[..., 0], torch.zeros_like(velocity_probs[..., 0]))
+    assert torch.equal(pedal_probs[..., 0], torch.zeros_like(pedal_probs[..., 0]))
+    assert torch.allclose(onset_probs[..., 1:], torch.full((1, 2, 3), 0.5))

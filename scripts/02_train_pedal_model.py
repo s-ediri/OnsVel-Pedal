@@ -16,6 +16,11 @@ It is structured in 3 parts:
 import gc
 import os
 import random
+import sys
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 # For omegaconf
 from dataclasses import dataclass
@@ -25,7 +30,6 @@ import numpy as np
 import pandas as pd
 import psutil
 import torch
-import torch.nn.functional as F
 
 #
 from omegaconf import OmegaConf
@@ -49,13 +53,18 @@ from ov_piano.data.maestro import (
 )
 from ov_piano.data.midi import MidiToPianoRoll
 from ov_piano.eval import GtLoaderMaestro, eval_note_events
-from ov_piano.inference import OnsetVelocityNmsDecoder, strided_inference
+from ov_piano.inference import (
+    OnsetVelocityNmsDecoder,
+    model_outputs_to_probabilities,
+    strided_inference,
+)
 from ov_piano.models.ov import OnsetsAndVelocities
 from ov_piano.optimizers import AdamWR
 from ov_piano.utils import (
     MaskedBCEWithLogitsLoss,
     ModelSaver,
     breakpoint_json,
+    format_load_model_warnings,
     load_model,
     load_resume_state,
     save_resume_state,
@@ -172,6 +181,13 @@ class ConfDef:
         "datasets", "MAESTROv3_roll_quant=0.024_midivals=128_extendsus=True.h5"
     )
     SNAPSHOT_INPATH: Optional[str] = None  # Auto-detected below if None
+    BASELINE_SNAPSHOT_INPATH: Optional[str] = os.path.join(
+        PROJECT_ROOT,
+        "out",
+        "model_snapshots",
+        "OnsetsAndVelocities_2023_03_04_09_53_53.289step=43500_f1=0.9675__0.9480.torch",
+    )
+    RESUME_FROM_LATEST: bool = False
     # data loader - optimized for 16GB RAM system with RTX 2070 SUPER (8GB VRAM)
     # PRODUCTION SETTINGS: Optimized for 3-5 day training with proper context
     TRAIN_BS: int = 2  # Small batch for memory constraints
@@ -183,9 +199,16 @@ class ConfDef:
     )
     GRADIENT_ACCUMULATION_STEPS: int = 8  # Effective batch size = 2 * 8 = 16
     # model/optimizer
-    CONV1X1: List[int] = (128, 128)  # Reduced architecture for memory efficiency
+    CONV1X1: List[int] = (200, 200)  # Matches the high-F1 bundled note checkpoint
     # optimizer
-    LR_MAX: float = 0.006  # Conservative learning rate for stable training
+    # Keep the original note-training LR available for explicit full-model runs,
+    # but use a much smaller default for pedal-head fine-tuning. The pedal head is
+    # randomly initialized when starting from the bundled note checkpoint; using
+    # the old full-model LR here makes optimization noisy and can encourage users
+    # to resume from checkpoints whose note backbone was accidentally degraded by
+    # earlier coupled training experiments.
+    LR_MAX: float = 0.006
+    PEDAL_LR_MAX: float = 0.0003
     LR_WARMUP: float = 0.5
     LR_PERIOD: int = 1500  # ~2-3 periods per epoch for good convergence
     LR_DECAY: float = 0.98  # Gentle decay across epochs
@@ -202,12 +225,14 @@ class ConfDef:
         3.0  # Increased - onsets are sparse, need higher weight
     )
     VEL_LOSS_LAMBDA: float = 10.0
-    PEDAL_LOSS_LAMBDA: float = (
-        0.5  # Auxiliary loss; keep low so note F1 is not degraded
-    )
+    PEDAL_LOSS_LAMBDA: float = 1.0
     PEDAL_POSITIVES_WEIGHT: float = 2.0
+    PEDAL_TRANSITION_WEIGHT: float = 2.0
+    MAX_GRAD_NORM: float = 1.0
     DETACH_PEDAL_FEATURES: bool = True
-    TRAINABLE_ONSETS: bool = True
+    PEDAL_ONLY_FINETUNE: bool = True
+    TRAINABLE_ONSETS: bool = False
+    LOG_NOTE_MONITOR_LOSSES: bool = True
     # decoder
     DECODER_GAUSS_STD: float = 1
     DECODER_GAUSS_KSIZE: int = 11
@@ -241,40 +266,55 @@ if __name__ == "__main__":
     cli_conf = OmegaConf.from_cli()
     CONF = OmegaConf.merge(CONF, cli_conf)
 
-    # Auto-detect latest checkpoint for resumption if not explicitly set
-    if CONF.SNAPSHOT_INPATH is None:
-        checkpoint_dir = os.path.join(CONF.OUTPUT_DIR, "model_snapshots")
-        if os.path.isdir(checkpoint_dir):
+    # Prefer the bundled note model by default so pedal-only fine-tuning starts
+    # from high onset/velocity F1. Set RESUME_FROM_LATEST=true or pass
+    # SNAPSHOT_INPATH explicitly to continue a previous generated run.
+    if CONF.SNAPSHOT_INPATH is None and CONF.RESUME_FROM_LATEST:
+        checkpoint_dirs = [os.path.join(CONF.OUTPUT_DIR, "model_snapshots")]
+        for checkpoint_dir in checkpoint_dirs:
+            if not os.path.isdir(checkpoint_dir):
+                continue
             checkpoints = sorted(
                 [f for f in os.listdir(checkpoint_dir) if f.endswith(".torch")],
                 key=lambda x: os.path.getmtime(os.path.join(checkpoint_dir, x)),
                 reverse=True,
             )
-            if checkpoints:
-                for checkpoint in checkpoints:
-                    candidate_path = os.path.join(checkpoint_dir, checkpoint)
-                    if os.path.getsize(candidate_path) < 1024:
-                        print(
-                            f"[AUTO-RESUME] Skipping tiny or incomplete checkpoint: {candidate_path}"
-                        )
-                        continue
-                    try:
-                        torch.load(candidate_path, map_location="cpu")
-                        CONF.SNAPSHOT_INPATH = candidate_path
-                        print(
-                            f"[AUTO-RESUME] Found latest valid checkpoint: {CONF.SNAPSHOT_INPATH}"
-                        )
-                        break
-                    except Exception as exc:
-                        print(
-                            f"[AUTO-RESUME] Skipping invalid checkpoint {candidate_path}: {exc}"
-                        )
-                if CONF.SNAPSHOT_INPATH is None:
-                    print("[AUTO-RESUME] No valid checkpoint found in model_snapshots.")
+            for checkpoint in checkpoints:
+                candidate_path = os.path.join(checkpoint_dir, checkpoint)
+                if os.path.getsize(candidate_path) < 1024:
+                    print(
+                        f"[AUTO-RESUME] Skipping tiny or incomplete checkpoint: {candidate_path}"
+                    )
+                    continue
+                try:
+                    torch.load(candidate_path, map_location="cpu")
+                    CONF.SNAPSHOT_INPATH = candidate_path
+                    print(
+                        f"[AUTO-RESUME] Found valid checkpoint: {CONF.SNAPSHOT_INPATH}"
+                    )
+                    break
+                except Exception as exc:
+                    print(
+                        f"[AUTO-RESUME] Skipping invalid checkpoint {candidate_path}: {exc}"
+                    )
+            if CONF.SNAPSHOT_INPATH is not None:
+                break
+        if CONF.SNAPSHOT_INPATH is None:
+            baseline_path = CONF.BASELINE_SNAPSHOT_INPATH
+            if baseline_path and os.path.isfile(baseline_path):
+                CONF.SNAPSHOT_INPATH = baseline_path
+                print(f"[AUTO-RESUME] Using bundled note baseline: {baseline_path}")
+            else:
+                print("[AUTO-RESUME] No valid checkpoint found.")
+    elif CONF.SNAPSHOT_INPATH is None:
+        baseline_path = CONF.BASELINE_SNAPSHOT_INPATH
+        if baseline_path and os.path.isfile(baseline_path):
+            CONF.SNAPSHOT_INPATH = baseline_path
+            print(f"[TRAINING] Using bundled note baseline: {baseline_path}")
 
     # if no seed is given, take a random one
     if CONF.RANDOM_SEED is None:
-        CONF.RANDOM_SEED = random.randint(0, 1e7)
+        CONF.RANDOM_SEED = random.randint(0, 10_000_000)
     set_seed(CONF.RANDOM_SEED)
 
     # derivative globals + parse HDF5 filenames and ensure they are consistent
@@ -306,8 +346,11 @@ if __name__ == "__main__":
     txt_logger = JsonColorLogger(f"[{os.path.basename(__file__)}]", TXT_LOG_OUTDIR)
     txt_logger.loj("PARAMETERS", OmegaConf.to_container(CONF))
 
-    # Load resume state if it exists (for mid-epoch resumption)
-    resume_state = load_resume_state(MODEL_SNAPSHOT_OUTDIR)
+    # Load resume state only when resuming from a generated training checkpoint.
+    snapshot_abs = os.path.abspath(CONF.SNAPSHOT_INPATH) if CONF.SNAPSHOT_INPATH else ""
+    snapshot_dir_abs = os.path.abspath(MODEL_SNAPSHOT_OUTDIR)
+    should_load_resume_state = snapshot_abs.startswith(snapshot_dir_abs + os.sep)
+    resume_state = load_resume_state(MODEL_SNAPSHOT_OUTDIR) if should_load_resume_state else None
     resume_epoch = 1
     resume_batch_idx = 0
     resume_global_step = 1
@@ -392,7 +435,58 @@ if __name__ == "__main__":
         dropout_drop_p=CONF.DROPOUT,
     ).to(CONF.DEVICE)
     if CONF.SNAPSHOT_INPATH is not None:
-        load_model(model, CONF.SNAPSHOT_INPATH, eval_phase=False)
+        load_report = load_model(model, CONF.SNAPSHOT_INPATH, eval_phase=False, strict=False)
+        for warning in format_load_model_warnings(load_report):
+            txt_logger.loj("CHECKPOINT_LOAD_WARNING", warning)
+    elif CONF.PEDAL_ONLY_FINETUNE:
+        raise RuntimeError(
+            "PEDAL_ONLY_FINETUNE=true requires a valid note checkpoint. "
+            "No SNAPSHOT_INPATH/BASELINE_SNAPSHOT_INPATH was found, so refusing "
+            "to freeze a randomly initialized onset/velocity backbone. Either "
+            "set SNAPSHOT_INPATH to a high-F1 note checkpoint, place the bundled "
+            "checkpoint under out/model_snapshots/, or run explicit full training "
+            "with PEDAL_ONLY_FINETUNE=false."
+        )
+
+    frozen_note_modules = (
+        model.specnorm,
+        model.stem,
+        model.onset_stages,
+        model.velocity_stage,
+    )
+    if CONF.PEDAL_ONLY_FINETUNE:
+        for module in frozen_note_modules:
+            module.eval()
+            for param in module.parameters():
+                param.requires_grad = False
+        for param in model.pedal_stage.parameters():
+            param.requires_grad = True
+        txt_logger.loj(
+            "TRAINING_MODE",
+            {
+                "mode": "pedal_only_finetune",
+                "note_backbone": "frozen_eval_mode",
+                "pedal_features": "detached",
+                "effective_lr_max": CONF.PEDAL_LR_MAX,
+                "reason": (
+                    "Preserve onset/velocity F-score while specializing only "
+                    "the sustain-pedal head."
+                ),
+            },
+        )
+    elif CONF.DETACH_PEDAL_FEATURES:
+        txt_logger.loj(
+            "TRAINING_MODE",
+            {
+                "mode": "joint_training_detached_pedal",
+                "note_backbone": "trainable" if CONF.TRAINABLE_ONSETS else "onsets_frozen_velocity_trainable",
+                "pedal_features": "detached",
+                "warning": (
+                    "Joint training can change note metrics. Use only after "
+                    "pedal-only fine-tuning has been evaluated."
+                ),
+            },
+        )
     model_saver = ModelSaver(
         model,
         MODEL_SNAPSHOT_OUTDIR,
@@ -423,18 +517,35 @@ if __name__ == "__main__":
     pedal_pos_weight = torch.FloatTensor([CONF.PEDAL_POSITIVES_WEIGHT]).to(CONF.DEVICE)
 
     # optimizer
-    trainable_params = (
-        model.parameters()
-        if CONF.TRAINABLE_ONSETS
-        else (
+    if CONF.PEDAL_ONLY_FINETUNE:
+        trainable_params = list(model.pedal_stage.parameters())
+    elif CONF.TRAINABLE_ONSETS:
+        trainable_params = list(model.parameters())
+    else:
+        trainable_params = (
             list(model.velocity_stage.parameters())
             + list(model.pedal_stage.parameters())
         )
+    trainable_param_count = sum(p.numel() for p in trainable_params if p.requires_grad)
+    frozen_param_count = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+    txt_logger.loj(
+        "PARAMETER_COUNTS",
+        {"trainable": trainable_param_count, "frozen": frozen_param_count},
     )
+    if CONF.PEDAL_ONLY_FINETUNE:
+        frozen_note_param_count = sum(
+            p.numel() for module in frozen_note_modules for p in module.parameters()
+            if not p.requires_grad
+        )
+        assert frozen_note_param_count > 0, "Expected note backbone parameters to be frozen"
+        assert all(
+            not p.requires_grad for module in frozen_note_modules for p in module.parameters()
+        ), "PEDAL_ONLY_FINETUNE must not update onset/velocity parameters"
 
+    effective_lr_max = CONF.PEDAL_LR_MAX if CONF.PEDAL_ONLY_FINETUNE else CONF.LR_MAX
     opt_hpars = {
-        "lr_max": CONF.LR_MAX,
-        "lr": CONF.LR_MAX,
+        "lr_max": effective_lr_max,
+        "lr": effective_lr_max,
         "lr_period": CONF.LR_PERIOD,
         "lr_decay": CONF.LR_DECAY,
         "lr_slowdown": CONF.LR_SLOWDOWN,
@@ -447,7 +558,19 @@ if __name__ == "__main__":
     }
     opt = AdamWR(trainable_params, **opt_hpars)
 
+    def keep_frozen_note_modules_eval():
+        if CONF.PEDAL_ONLY_FINETUNE:
+            for module in frozen_note_modules:
+                module.eval()
+
     def training_forward(x):
+        if CONF.PEDAL_ONLY_FINETUNE:
+            with torch.no_grad():
+                onset_stages, stem_out = model.forward_onsets(x)
+                features = torch.cat([stem_out, onset_stages[-1].unsqueeze(1)], dim=1)
+                velocities = model.velocity_stage(features).squeeze(1)
+            pedals = model.forward_pedals(features.detach())
+            return onset_stages, velocities, pedals
         if CONF.TRAINABLE_ONSETS:
             onset_stages, stem_out = model.forward_onsets(x)
             features = torch.cat([stem_out, onset_stages[-1].unsqueeze(1)], dim=1)
@@ -457,7 +580,7 @@ if __name__ == "__main__":
                 features = torch.cat([stem_out, onset_stages[-1].unsqueeze(1)], dim=1)
         velocities = model.velocity_stage(features).squeeze(1)
         pedal_features = features.detach() if CONF.DETACH_PEDAL_FEATURES else features
-        pedals = model.pedal_stage(pedal_features).squeeze(1).mean(dim=1, keepdim=True)
+        pedals = model.forward_pedals(pedal_features)
         return onset_stages, velocities, pedals
 
     # ##########################################################################
@@ -468,10 +591,7 @@ if __name__ == "__main__":
         Convenience wrapper around the DNN to ensure output and input sequences
         have same length. Model now returns (onsets, velocities, pedals).
         """
-        probs, vels, _ = model(x)  # Ignore pedal predictions during evaluation
-        probs = F.pad(torch.sigmoid(probs[-1]), (1, 0))
-        vels = F.pad(torch.sigmoid(vels), (1, 0))
-        return probs, vels
+        return model_outputs_to_probabilities(model(x), include_pedals=False)
 
     def xv_file(mel, md, thresholds=[0.5], verbose=False):
         """
@@ -660,6 +780,7 @@ if __name__ == "__main__":
                 cleanup_memory(verbose=True)
                 torch.cuda.empty_cache()
                 model.train()
+                keep_frozen_note_modules_eval()
 
             # ##################################################################
             # # TRAINING
@@ -712,12 +833,26 @@ if __name__ == "__main__":
                         module.eval()
 
             # Forward pass: returns onset_stages, velocities, and sustain pedal predictions
+            keep_frozen_note_modules_eval()
             onset_stages, velocities, pedals = training_forward(logmels)
             # Shapes: onset_stages: list of (b, 88, t), velocities: (b, 88, t), pedals: (b, 1, t)
 
-            vel_loss = CONF.VEL_LOSS_LAMBDA * vel_loss_fn(
-                velocities, onsets_norm, mask=onsets_clip
-            )
+            if CONF.PEDAL_ONLY_FINETUNE:
+                with torch.no_grad():
+                    if CONF.LOG_NOTE_MONITOR_LOSSES:
+                        vel_loss = CONF.VEL_LOSS_LAMBDA * vel_loss_fn(
+                            velocities, onsets_norm, mask=onsets_clip
+                        )
+                        ons_loss = sum(
+                            ons_loss_fn(ons, onsets_clip) for ons in onset_stages
+                        ) / len(onset_stages)
+                    else:
+                        vel_loss = torch.zeros((), device=CONF.DEVICE)
+                        ons_loss = torch.zeros((), device=CONF.DEVICE)
+            else:
+                vel_loss = CONF.VEL_LOSS_LAMBDA * vel_loss_fn(
+                    velocities, onsets_norm, mask=onsets_clip
+                )
 
             pedal_logits = pedals.reshape(-1)
             pedal_targets = sustain_active.reshape(-1)
@@ -728,7 +863,9 @@ if __name__ == "__main__":
             )
             if pedal_transition_mask.numel() > 0:
                 pedal_transition_weights = torch.ones_like(pedal_frame_targets)
-                pedal_transition_weights[:, 1:] += pedal_transition_mask
+                pedal_transition_weights[:, 1:] += (
+                    CONF.PEDAL_TRANSITION_WEIGHT - 1.0
+                ) * pedal_transition_mask
                 pedal_weights = pedal_transition_weights.reshape(-1)
             pedal_loss = (
                 CONF.PEDAL_LOSS_LAMBDA
@@ -741,8 +878,8 @@ if __name__ == "__main__":
             )
             pedal_loss = (pedal_loss * pedal_weights).mean()
 
-            loss = vel_loss + pedal_loss
-            if CONF.TRAINABLE_ONSETS:
+            loss = pedal_loss if CONF.PEDAL_ONLY_FINETUNE else vel_loss + pedal_loss
+            if CONF.TRAINABLE_ONSETS and not CONF.PEDAL_ONLY_FINETUNE:
                 ons_loss = sum(
                     ons_loss_fn(ons, onsets_clip) for ons in onset_stages
                 ) / len(onset_stages)
@@ -762,6 +899,8 @@ if __name__ == "__main__":
 
             # Update weights after accumulation steps
             if (global_step % CONF.GRADIENT_ACCUMULATION_STEPS) == 0:
+                if CONF.MAX_GRAD_NORM and CONF.MAX_GRAD_NORM > 0:
+                    torch.nn.utils.clip_grad_norm_(trainable_params, CONF.MAX_GRAD_NORM)
                 opt.step()
                 # Resume training mode for batch norm (was in eval for forward pass)
                 for module in model.modules():
@@ -773,9 +912,14 @@ if __name__ == "__main__":
                 cleanup_memory(verbose=False)
             #
             if (global_step % CONF.TRAIN_LOG_EVERY) == 0:
-                losses = [vel_loss.item(), pedal_loss.item()]
-                if CONF.TRAINABLE_ONSETS:
-                    losses.append(ons_loss.item())
+                note_monitor_losses = {
+                    "vel": vel_loss.item(),
+                    "ons": ons_loss.item() if "ons_loss" in locals() else None,
+                }
+                logged_losses = {"pedal": pedal_loss.item()}
+                if not CONF.PEDAL_ONLY_FINETUNE:
+                    logged_losses["vel"] = vel_loss.item()
+                    logged_losses["ons"] = note_monitor_losses["ons"]
                 txt_logger.loj(
                     "TRAIN",
                     {
@@ -783,11 +927,15 @@ if __name__ == "__main__":
                         "step": batch_idx,
                         "global_step": global_step,
                         "batches_per_epoch": batches_per_epoch,
-                        "losses": {
-                            "vel": losses[0],
-                            "pedal": losses[1],
-                            "ons": losses[2] if len(losses) > 2 else None,
-                        },
+                        "losses": logged_losses,
+                        "note_monitor_losses": (
+                            note_monitor_losses if CONF.PEDAL_ONLY_FINETUNE else None
+                        ),
+                        "loss_mode": (
+                            "pedal_only_note_losses_are_monitoring_only"
+                            if CONF.PEDAL_ONLY_FINETUNE
+                            else "joint_loss"
+                        ),
                         "LR": opt.get_lr(),
                     },
                 )
