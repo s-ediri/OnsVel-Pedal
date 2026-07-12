@@ -69,16 +69,18 @@ def test_api_models_returns_available_checkpoint_names(client, tmp_path, monkeyp
     assert response.get_json() == ["first.torch", "second.torch"]
 
 
-def test_index_labels_notation_view_as_approximate_preview(client):
+def test_index_shows_piano_roll_without_sheet_music_preview(client):
     response = client.get("/")
 
     html = response.get_data(as_text=True)
     assert response.status_code == 200
-    assert "notation-preview-container" in html
-    assert "Approximate pitch preview" in html
-    assert "Not a score/export" in html
-    assert "approximate, unquantized pitch sketch" in html
-    assert "does not infer key signature, meter, rests, voices, hands, chords, or true note durations" in html
+    assert "piano-roll-canvas" in html
+    assert "Piano roll" in html
+    assert "Pedal onset" in html
+    assert "Sustain held" in html
+    assert "notation-preview-container" not in html
+    assert "Approximate pitch preview" not in html
+    assert "abcjs" not in html.lower()
 
 
 def test_api_transcribe_requires_audio_file(client):
@@ -216,23 +218,49 @@ def test_api_transcribe_rejects_invalid_audio(client, tmp_path, monkeypatch):
     assert response.get_json()["error"] == "Could not decode audio"
 
 
-def test_api_transcribe_rejects_oversized_audio_file(client, tmp_path, monkeypatch):
+def test_api_transcribe_accepts_audio_larger_than_previous_size_cap(client, tmp_path, monkeypatch):
     model_path = tmp_path / "model.torch"
     model_path.write_bytes(b"checkpoint")
+    model = object()
+    logmel = torch.zeros(1, 4, 8)
     monkeypatch.setattr(
         web_app,
         "_available_checkpoints",
         lambda: OrderedDict([("model.torch", str(model_path))]),
     )
+    monkeypatch.setattr(web_app.transcriber, "preprocess_audio", lambda *_args, **_kwargs: logmel)
+    monkeypatch.setattr(web_app.transcriber, "load_model", lambda snapshot_path: model)
+    monkeypatch.setattr(
+        web_app.transcriber,
+        "run_inference_and_decode",
+        lambda loaded_model, processed_logmel: _tiny_transcription_result(),
+    )
 
     response = client.post(
         "/api/transcribe",
-        data=_upload(audio_bytes=b"0" * (web_app.CONF.MAX_FILE_SIZE + 1)),
+        data=_upload(audio_bytes=b"0" * ((25 * 1024 * 1024) + 1)),
         content_type="multipart/form-data",
     )
 
-    assert response.status_code == 413
-    assert response.get_json()["error"] == "Request exceeds the upload limit of 25 MB."
+    assert response.status_code == 200
+
+
+def test_process_audio_does_not_cap_duration(monkeypatch):
+    calls = {}
+
+    def fake_preprocess_audio(audio_file, **kwargs):
+        calls["audio_file"] = audio_file
+        calls.update(kwargs)
+        return torch.zeros(1, 4, 8)
+
+    audio_file = BytesIO(b"fake wav bytes")
+    monkeypatch.setattr(web_app.transcriber, "preprocess_audio", fake_preprocess_audio)
+
+    web_app._process_audio(audio_file)
+
+    assert calls["audio_file"] is audio_file
+    assert calls["max_duration_secs"] is None
+    assert calls["decode_with_pydub"] is True
 
 
 def test_api_transcribe_success_with_mocked_inference(client, tmp_path, monkeypatch):
@@ -268,10 +296,46 @@ def test_api_transcribe_success_with_mocked_inference(client, tmp_path, monkeypa
             "start": pytest.approx(0.048),
             "velocity": 0.75,
             "duration": 0.4,
+            "duration_estimated": True,
         }
     ]
-    assert payload["pedals"] == [{"start": pytest.approx(0.024), "duration": pytest.approx(0.072)}]
+    assert payload["pedals"] == [
+        {
+            "pedal_idx": 0,
+            "start": pytest.approx(0.024),
+            "end": pytest.approx(0.096),
+            "duration": pytest.approx(0.072),
+            "offset_estimated": False,
+        }
+    ]
     assert payload["duration"] == pytest.approx(0.192)
+
+
+def test_format_results_extends_unclosed_pedal_to_transcription_end():
+    result = TranscriptionResult(
+        notes=pd.DataFrame(columns=["batch_idx", "key", "t_idx", "prob", "vel"]),
+        pedal_events=pd.DataFrame(
+            [
+                {"batch_idx": 0, "pedal_idx": 0, "t_idx": 2, "event_type": "onset"},
+            ]
+        ),
+        logmel=torch.zeros(1, 4, 10),
+    )
+
+    with web_app.app.app_context():
+        response = web_app._format_results(result.notes, result.pedal_events, result.logmel)
+
+    payload = response.get_json()
+    assert payload["duration"] == pytest.approx(0.24)
+    assert payload["pedals"] == [
+        {
+            "pedal_idx": 0,
+            "start": pytest.approx(0.048),
+            "end": pytest.approx(0.24),
+            "duration": pytest.approx(0.192),
+            "offset_estimated": True,
+        }
+    ]
 
 
 def test_get_cached_model_reuses_same_path_mtime_and_device(tmp_path, monkeypatch):

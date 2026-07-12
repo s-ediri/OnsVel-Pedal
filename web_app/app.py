@@ -4,7 +4,6 @@ import os
 import sys
 from threading import Lock
 from flask import Flask, render_template, request, jsonify
-from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 
 # Make sure to run `pip install Flask` in your `onsvel` conda environment
@@ -32,10 +31,7 @@ class AppConfig:
     UPLOADS_DIR = os.path.join(SCRIPT_DIR, "..", "uploads")
 
     # Limits
-    MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
-    MAX_AUDIO_DURATION = 5 * 60  # 5 minutes
     MODEL_CACHE_SIZE = 2
-    MAX_CONTENT_LENGTH = MAX_FILE_SIZE
 
     # Loading arbitrary uploaded PyTorch checkpoints is unsafe because PyTorch
     # deserialization can execute code. Keep this disabled for normal/server use;
@@ -53,10 +49,10 @@ TRANSCRIPTION_CONF = TranscriptionConfig(
     inference_chunk_size_secs=20.0,
     inference_chunk_overlap_secs=1.0,
 )
+NOTE_ONSET_VISUAL_DURATION_SECS = 0.4
 
 # --- Global Objects (initialized once) ---
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = CONF.MAX_CONTENT_LENGTH
 transcriber = PianoTranscriber(TRANSCRIPTION_CONF)
 _model_cache = OrderedDict()
 _model_cache_lock = Lock()
@@ -74,14 +70,6 @@ def get_models():
         return jsonify(list(_available_checkpoints().keys()))
     except OSError as e:
         return jsonify({"error": str(e)}), 500
-
-
-@app.errorhandler(RequestEntityTooLarge)
-def handle_request_entity_too_large(_error):
-    """Return JSON when Flask rejects an oversized upload."""
-    limit_mb = CONF.MAX_CONTENT_LENGTH // 1024 // 1024
-    return jsonify({"error": f"Request exceeds the upload limit of {limit_mb} MB."}), 413
-
 
 @app.route("/api/transcribe", methods=["POST"])
 def transcribe():
@@ -174,42 +162,24 @@ def _format_results(pred_df, events_df, logmel):
             "pitch": int(row["key"] + transcriber.key_beg),
             "start": float(row["t_idx"] * transcriber.secs_per_frame),
             "velocity": float(row["vel"]),
-            "duration": 0.4  # The model doesn"t predict duration, so use a fixed value
+            # The note model predicts onset/velocity, not note-off times. Keep a
+            # short synthetic duration for fallback synth playback, but mark it
+            # as estimated so the piano roll draws an onset marker instead of an
+            # apparently precise note-offset bar.
+            "duration": NOTE_ONSET_VISUAL_DURATION_SECS,
+            "duration_estimated": True,
         })
         if len(notes) >= max_notes:
             break
 
-    pedals = []
-    for pedal_idx, group in events_df.groupby("pedal_idx"):
-        onsets = sorted(group[group["event_type"] == "onset"]["t_idx"].values)
-        offsets = sorted(group[group["event_type"] == "offset"]["t_idx"].values)
-
-        i, j = 0, 0
-        while i < len(onsets):
-            onset_frame = onsets[i]
-            
-            # Find the next offset that occurs after the current onset
-            next_offset_idx = -1
-            for k in range(j, len(offsets)):
-                if offsets[k] > onset_frame:
-                    next_offset_idx = k
-                    break
-
-            if next_offset_idx != -1:
-                offset_frame = offsets[next_offset_idx]
-                # Find the next onset to check if this offset is valid
-                next_onset_frame = onsets[i+1] if (i + 1) < len(onsets) else float("inf")
-
-                # The offset is valid if it occurs before the next onset
-                if offset_frame < next_onset_frame:
-                    pedals.append({
-                        "start": float(onset_frame * transcriber.secs_per_frame),
-                        "duration": float((offset_frame - onset_frame) * transcriber.secs_per_frame)
-                    })
-                    j = next_offset_idx + 1
-            i += 1
-
     total_duration = float(logmel.shape[-1] * transcriber.secs_per_frame)
+    pedals = []
+    for interval in _paired_pedal_intervals(
+        events_df,
+        transcriber.secs_per_frame,
+        fallback_end_secs=total_duration,
+    ):
+        pedals.append(interval)
 
     return jsonify({
         "notes": notes,
@@ -217,22 +187,60 @@ def _format_results(pred_df, events_df, logmel):
         "duration": total_duration
     })
 
+
+def _paired_pedal_intervals(events_df, secs_per_frame, fallback_end_secs=None):
+    """Return frontend-ready sustain-pedal hold intervals.
+
+    The decoder emits discrete pedal-down/onset and pedal-up/offset events. The
+    piano roll needs paired intervals, so each onset is matched with the next
+    later offset for the same pedal. If the final onset has no offset, extend it
+    to the transcription end and mark that end as estimated instead of dropping
+    the visible sustain hold entirely.
+    """
+    required_columns = {"pedal_idx", "t_idx", "event_type"}
+    if events_df is None or events_df.empty or not required_columns.issubset(events_df.columns):
+        return []
+
+    intervals = []
+    for pedal_idx, group in events_df.groupby("pedal_idx"):
+        onsets = sorted(group[group["event_type"] == "onset"]["t_idx"].values)
+        offsets = sorted(group[group["event_type"] == "offset"]["t_idx"].values)
+
+        offset_cursor = 0
+        for onset_frame in onsets:
+            while offset_cursor < len(offsets) and offsets[offset_cursor] <= onset_frame:
+                offset_cursor += 1
+
+            offset_estimated = False
+            if offset_cursor < len(offsets):
+                end = float(offsets[offset_cursor] * secs_per_frame)
+                offset_cursor += 1
+            elif fallback_end_secs is not None:
+                end = float(fallback_end_secs)
+                offset_estimated = True
+            else:
+                break
+
+            start = float(onset_frame * secs_per_frame)
+            duration = end - start
+            if duration <= 0:
+                continue
+
+            intervals.append({
+                "pedal_idx": int(pedal_idx),
+                "start": start,
+                "end": end,
+                "duration": duration,
+                "offset_estimated": offset_estimated,
+            })
+
+    return intervals
+
 def _process_audio(audio_file):
-    """Loads, validates, and preprocesses the audio file."""
-    # Check file size
-    audio_file.seek(0, os.SEEK_END)
-    file_length = audio_file.tell()
-    audio_file.seek(0, os.SEEK_SET)
-
-    if file_length > CONF.MAX_FILE_SIZE:
-        raise AudioPreprocessingError(
-            f"File size exceeds the limit of {CONF.MAX_FILE_SIZE // 1024 // 1024} MB.",
-            status_code=413,
-        )
-
+    """Loads and preprocesses the audio file without upload size/duration caps."""
     return transcriber.preprocess_audio(
         audio_file,
-        max_duration_secs=CONF.MAX_AUDIO_DURATION,
+        max_duration_secs=None,
         decode_with_pydub=True,
     )
 

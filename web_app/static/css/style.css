@@ -199,12 +199,16 @@ main {
 .visualization {
     width: 100%;
     overflow-x: auto;
+    overflow-y: hidden;
     position: relative;
     border: 1px solid var(--border-color);
     border-radius: var(--border-radius);
     margin-bottom: 1rem;
     background-color: #fff;
-    height: 400px;
+    min-height: 400px;
+    height: auto;
+    padding-bottom: 18px;
+    cursor: pointer;
 }
 
 #piano-roll-canvas {
@@ -218,9 +222,10 @@ main {
 .piano-roll-spacer {
     pointer-events: none;
     visibility: hidden;
+    height: 0;
 }
 
-.notation-preview {
+.piano-roll-panel {
     width: 100%;
     box-sizing: border-box;
     margin-bottom: 1rem;
@@ -230,49 +235,74 @@ main {
     border: 1px solid var(--border-color);
 }
 
-.notation-preview-header {
+.piano-roll-header {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
     gap: 1rem;
     flex-wrap: wrap;
-    margin-bottom: 0.5rem;
 }
 
-.notation-preview h3 {
+.piano-roll-header h3 {
     margin: 0;
     color: var(--text-color);
 }
 
-.preview-badge {
-    display: inline-flex;
-    align-items: center;
-    padding: 0.25rem 0.6rem;
-    border-radius: 999px;
-    background-color: #fff3cd;
-    color: #664d03;
-    font-size: 0.8rem;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-}
-
-.preview-disclaimer {
-    margin: 0 0 1rem;
+.piano-roll-header p {
+    margin: 0.25rem 0 0;
     color: var(--secondary-color);
     font-size: 0.95rem;
 }
 
-#notation-preview-container {
-    width: 100%;
-    overflow-x: auto;
+.piano-roll-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    align-items: center;
+    color: var(--secondary-color);
+    font-size: 0.9rem;
 }
 
-.preview-truncation-note {
-    margin: 0.75rem 0 0;
-    color: var(--secondary-color);
-    font-size: 0.85rem;
-    font-style: italic;
+.piano-roll-legend span {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+}
+
+.piano-roll-legend i {
+    display: inline-block;
+    width: 1rem;
+    height: 0.75rem;
+    border-radius: 0.2rem;
+}
+
+.legend-note {
+    background: #111827;
+}
+
+.legend-pedal {
+    background: rgba(37, 99, 235, 0.25);
+    border: 1px solid rgba(37, 99, 235, 0.65);
+}
+
+.legend-pedal-onset {
+    width: 0 !important;
+    height: 0 !important;
+    background: transparent;
+    border-left: 0.2rem solid transparent;
+    border-right: 0.2rem solid transparent;
+    border-bottom: 0.45rem solid rgba(220, 38, 38, 0.65);
+    border-radius: 0 !important;
+}
+
+.legend-pedal-offset {
+    width: 0 !important;
+    height: 0 !important;
+    background: transparent;
+    border-left: 0.2rem solid transparent;
+    border-right: 0.2rem solid transparent;
+    border-top: 0.45rem solid rgba(22, 163, 74, 0.75);
+    border-radius: 0 !important;
 }
 
 @keyframes spin {

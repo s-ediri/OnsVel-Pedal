@@ -52,7 +52,8 @@ from ov_piano.data.maestro import (
     MetaMAESTROv3,
 )
 from ov_piano.data.midi import MidiToPianoRoll
-from ov_piano.eval import GtLoaderMaestro, eval_note_events
+from ov_piano.data.pedal import sustain_pedal_targets_from_values
+from ov_piano.eval import GtLoaderMaestro, eval_note_events, pedal_grid_search
 from ov_piano.inference import (
     OnsetVelocityNmsDecoder,
     model_outputs_to_probabilities,
@@ -190,14 +191,14 @@ class ConfDef:
     RESUME_FROM_LATEST: bool = False
     # data loader - optimized for 16GB RAM system with RTX 2070 SUPER (8GB VRAM)
     # PRODUCTION SETTINGS: Optimized for 3-5 day training with proper context
-    TRAIN_BS: int = 2  # Small batch for memory constraints
+    TRAIN_BS: int = 1  # Longer pedal context needs a smaller physical batch
     TRAIN_BATCH_SECS: float = (
-        4.0  # 4-second chunks - good context for learning onset patterns
+        12.0  # Longer context helps phrase-level sustain-pedal decisions
     )
     DATALOADER_WORKERS: int = (
         0  # Windows + HDF5 doesn't support multiprocessing (h5py not pickleable)
     )
-    GRADIENT_ACCUMULATION_STEPS: int = 8  # Effective batch size = 2 * 8 = 16
+    GRADIENT_ACCUMULATION_STEPS: int = 16  # Effective batch size = 1 * 16 = 16
     # model/optimizer
     CONV1X1: List[int] = (200, 200)  # Matches the high-F1 bundled note checkpoint
     # optimizer
@@ -227,7 +228,10 @@ class ConfDef:
     VEL_LOSS_LAMBDA: float = 10.0
     PEDAL_LOSS_LAMBDA: float = 1.0
     PEDAL_POSITIVES_WEIGHT: float = 2.0
-    PEDAL_TRANSITION_WEIGHT: float = 2.0
+    PEDAL_TRANSITION_WEIGHT: float = 6.0
+    PEDAL_EVENT_LOSS_LAMBDA: float = 2.0
+    PEDAL_EVENT_POSITIVES_WEIGHT: float = 12.0
+    PEDAL_TRANSITION_TARGET_WIDTH: int = 1
     MAX_GRAD_NORM: float = 1.0
     DETACH_PEDAL_FEATURES: bool = True
     PEDAL_ONLY_FINETUNE: bool = True
@@ -248,6 +252,24 @@ class ConfDef:
         0.5,
         0.75,
     )  # Test multiple thresholds for sustain pedal
+    # pedal validation/search during training
+    PEDAL_VALIDATION_EVERY: int = 1000
+    PEDAL_VALIDATION_TAKE_ONE_EVERY: int = 20
+    PEDAL_SEARCH_THRESHOLDS: List[float] = (
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9,
+    )
+    PEDAL_SEARCH_HYSTERESIS: List[float] = (0.02, 0.05, 0.1, 0.15)
+    PEDAL_SEARCH_SMOOTHING_WINDOWS: List[int] = (1, 3, 5, 7, 11)
+    PEDAL_SEARCH_MIN_HOLD_STEPS: List[int] = (1, 2, 4, 8)
+    PEDAL_SEARCH_SHIFTS: List[float] = (-0.05, -0.025, 0.0, 0.025, 0.05)
     # xv tolerances
     XV_TOLERANCE_SECS: float = 0.05
     XV_TOLERANCE_VEL: float = 0.1
@@ -436,7 +458,34 @@ if __name__ == "__main__":
     ).to(CONF.DEVICE)
     if CONF.SNAPSHOT_INPATH is not None:
         load_report = load_model(model, CONF.SNAPSHOT_INPATH, eval_phase=False, strict=False)
-        for warning in format_load_model_warnings(load_report):
+        pedal_key_prefixes = (
+            "pedal_stage.",
+            "pedal_state_head.",
+            "pedal_onset_head.",
+            "pedal_offset_head.",
+        )
+        missing_pedal_keys = [
+            key for key in load_report["missing_keys"]
+            if key.startswith(pedal_key_prefixes)
+        ]
+        ignored_missing_prefixes = pedal_key_prefixes if CONF.PEDAL_ONLY_FINETUNE else ()
+        if missing_pedal_keys and CONF.PEDAL_ONLY_FINETUNE:
+            txt_logger.loj(
+                "PEDAL_STAGE_INIT",
+                {
+                    "checkpoint": CONF.SNAPSHOT_INPATH,
+                    "missing_pedal_keys": len(missing_pedal_keys),
+                    "action": (
+                        "Initialized pedal_stage with fresh random weights. "
+                        "This is expected when fine-tuning pedals from the "
+                        "bundled note-only baseline checkpoint."
+                    ),
+                },
+            )
+        for warning in format_load_model_warnings(
+            load_report,
+            ignored_missing_key_prefixes=ignored_missing_prefixes,
+        ):
             txt_logger.loj("CHECKPOINT_LOAD_WARNING", warning)
     elif CONF.PEDAL_ONLY_FINETUNE:
         raise RuntimeError(
@@ -454,12 +503,13 @@ if __name__ == "__main__":
         model.onset_stages,
         model.velocity_stage,
     )
+    pedal_modules = model.pedal_modules()
     if CONF.PEDAL_ONLY_FINETUNE:
         for module in frozen_note_modules:
             module.eval()
             for param in module.parameters():
                 param.requires_grad = False
-        for param in model.pedal_stage.parameters():
+        for param in model.pedal_parameters():
             param.requires_grad = True
         txt_logger.loj(
             "TRAINING_MODE",
@@ -518,13 +568,13 @@ if __name__ == "__main__":
 
     # optimizer
     if CONF.PEDAL_ONLY_FINETUNE:
-        trainable_params = list(model.pedal_stage.parameters())
+        trainable_params = list(model.pedal_parameters())
     elif CONF.TRAINABLE_ONSETS:
         trainable_params = list(model.parameters())
     else:
         trainable_params = (
             list(model.velocity_stage.parameters())
-            + list(model.pedal_stage.parameters())
+            + list(model.pedal_parameters())
         )
     trainable_param_count = sum(p.numel() for p in trainable_params if p.requires_grad)
     frozen_param_count = sum(p.numel() for p in model.parameters() if not p.requires_grad)
@@ -592,6 +642,10 @@ if __name__ == "__main__":
         have same length. Model now returns (onsets, velocities, pedals).
         """
         return model_outputs_to_probabilities(model(x), include_pedals=False)
+
+    def pedal_model_inference(x):
+        """Model inference wrapper that includes sustain-pedal probabilities."""
+        return model_outputs_to_probabilities(model(x), include_pedals=True)
 
     def xv_file(mel, md, thresholds=[0.5], verbose=False):
         """
@@ -666,11 +720,159 @@ if __name__ == "__main__":
         #
         return results, results_vel
 
+    def run_pedal_validation(epoch, batch_idx, global_step):
+        """Evaluate sustain-pedal F1 on the validation split and tune decoder knobs."""
+        if xv_gt_loader is None:
+            txt_logger.loj(
+                "PEDAL_VALIDATION_SKIP",
+                {"reason": "validation ground-truth loader is unavailable"},
+            )
+            return None
+
+        model.eval()
+        cleanup_memory(verbose=False)
+        pedal_eval_items = []
+        len_xv = len(maestro_xv)
+        take_every = max(1, int(CONF.PEDAL_VALIDATION_TAKE_ONE_EVERY))
+
+        with torch.no_grad():
+            for ii, (mel, roll, md) in enumerate(maestro_xv, 1):
+                if take_every > 1 and ((ii - 1) % take_every) != 0:
+                    continue
+                txt_logger.loj(
+                    "PEDAL_VALIDATION_PROCESSING",
+                    {
+                        "idx": ii,
+                        "len_xv": len_xv,
+                        "take_one_every": take_every,
+                        "filename": md[0],
+                    },
+                )
+                try:
+                    tmel = torch.from_numpy(mel).to(CONF.DEVICE).unsqueeze(0)
+                    if tmel.shape[-1] == 0:
+                        txt_logger.loj(
+                            "PEDAL_VALIDATION_SKIP_FILE",
+                            {"filename": md[0], "reason": "empty mel input"},
+                        )
+                        continue
+
+                    outputs = strided_inference(
+                        pedal_model_inference, tmel, XV_CHUNK_SIZE, XV_CHUNK_OVERLAP
+                    )
+                    if not outputs or len(outputs) < 3 or outputs[2] is None:
+                        txt_logger.loj(
+                            "PEDAL_VALIDATION_SKIP_FILE",
+                            {"filename": md[0], "reason": "missing pedal output"},
+                        )
+                        continue
+
+                    pedal_pred = outputs[2]
+                    if pedal_pred.dim() == 2:
+                        pedal_pred = pedal_pred.unsqueeze(0)
+                    gt_pedal_df = xv_gt_loader.get_sus_pedal_events(md, SECS_PER_FRAME)
+                    pedal_eval_items.append((gt_pedal_df, pedal_pred))
+
+                except Exception as exc:
+                    txt_logger.loj(
+                        "PEDAL_VALIDATION_FILE_ERROR",
+                        {"filename": md[0], "error": str(exc)},
+                    )
+                finally:
+                    for name in ("tmel", "outputs", "pedal_pred"):
+                        if name in locals():
+                            try:
+                                del locals()[name]
+                            except Exception:
+                                pass
+                    del mel, roll, md
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+        if len(pedal_eval_items) == 0:
+            txt_logger.loj(
+                "PEDAL_VALIDATION_SKIP",
+                {"reason": "no validation files produced pedal predictions"},
+            )
+            return None
+
+        txt_logger.loj(
+            "PEDAL_VALIDATION_SEARCH_START",
+            {
+                "epoch": epoch,
+                "batch_idx": batch_idx,
+                "global_step": global_step,
+                "num_files": len(pedal_eval_items),
+                "thresholds": list(CONF.PEDAL_SEARCH_THRESHOLDS),
+                "hysteresis": list(CONF.PEDAL_SEARCH_HYSTERESIS),
+                "smoothing_windows": list(CONF.PEDAL_SEARCH_SMOOTHING_WINDOWS),
+                "min_hold_steps": list(CONF.PEDAL_SEARCH_MIN_HOLD_STEPS),
+                "shifts": list(CONF.PEDAL_SEARCH_SHIFTS),
+            },
+        )
+        summary, best_params, best_metrics = pedal_grid_search(
+            pedal_eval_items,
+            SECS_PER_FRAME,
+            thresholds=CONF.PEDAL_SEARCH_THRESHOLDS,
+            hysteresis_values=CONF.PEDAL_SEARCH_HYSTERESIS,
+            smoothing_windows=CONF.PEDAL_SEARCH_SMOOTHING_WINDOWS,
+            min_hold_steps_values=CONF.PEDAL_SEARCH_MIN_HOLD_STEPS,
+            shifts=CONF.PEDAL_SEARCH_SHIFTS,
+            tol_secs=CONF.XV_TOLERANCE_SECS,
+        )
+        if best_params is None:
+            txt_logger.loj(
+                "PEDAL_VALIDATION_SKIP",
+                {"reason": "no pedal hyperparameter combinations were evaluated"},
+            )
+            return None
+
+        top_results = sorted(
+            summary.items(), key=lambda item: float(item[1][2]), reverse=True
+        )[:10]
+        top_results = [
+            {
+                "threshold": params[0],
+                "hysteresis": params[1],
+                "smoothing_window": params[2],
+                "min_hold_steps": params[3],
+                "shift": params[4],
+                "precision": float(metrics[0]),
+                "recall": float(metrics[1]),
+                "f1": float(metrics[2]),
+            }
+            for params, metrics in top_results
+        ]
+        best = {
+            "threshold": best_params[0],
+            "hysteresis": best_params[1],
+            "smoothing_window": best_params[2],
+            "min_hold_steps": best_params[3],
+            "shift": best_params[4],
+            "precision": float(best_metrics[0]),
+            "recall": float(best_metrics[1]),
+            "f1": float(best_metrics[2]),
+        }
+        txt_logger.loj(
+            "PEDAL_VALIDATION_SUMMARY",
+            {
+                "epoch": epoch,
+                "batch_idx": batch_idx,
+                "global_step": global_step,
+                "num_files": len(pedal_eval_items),
+                "best": best,
+                "top_results": top_results,
+            },
+        )
+        return best
+
     # ##########################################################################
     # # TRAINING LOOP
     # ##########################################################################
     txt_logger.loj("MODEL_INFO", {"class": model.__class__.__name__})
     global_step = resume_global_step
+    best_pedal_f1 = -1.0
     onsets_beg, onsets_end = maestro_train.ONSETS_RANGE
     frames_beg, frames_end = maestro_train.FRAMES_RANGE
 
@@ -783,20 +985,78 @@ if __name__ == "__main__":
                 keep_frozen_note_modules_eval()
 
             # ##################################################################
+            # # PEDAL VALIDATION + BEST CHECKPOINT
+            # ##################################################################
+            if (
+                CONF.PEDAL_VALIDATION_EVERY > 0
+                and (global_step % CONF.PEDAL_VALIDATION_EVERY) == 0
+            ):
+                try:
+                    pedal_best = run_pedal_validation(epoch, batch_idx, global_step)
+                    if pedal_best is not None:
+                        pedal_f1 = float(pedal_best["f1"])
+                        if pedal_f1 > best_pedal_f1:
+                            best_pedal_f1 = pedal_f1
+                            checkpoint_path = model_saver(
+                                f"step={global_step}_pedal_f1={pedal_f1:.4f}_pedal_best"
+                            )
+                            save_resume_state(
+                                epoch, batch_idx + 1, global_step, MODEL_SNAPSHOT_OUTDIR
+                            )
+                            txt_logger.loj(
+                                "PEDAL_VALIDATION_BEST_CHECKPOINT",
+                                {
+                                    "epoch": epoch,
+                                    "batch_idx": batch_idx,
+                                    "global_step": global_step,
+                                    "checkpoint": checkpoint_path,
+                                    "best_pedal_f1": best_pedal_f1,
+                                    "decoder_hyperparameters": {
+                                        "threshold": pedal_best["threshold"],
+                                        "hysteresis": pedal_best["hysteresis"],
+                                        "smoothing_window": pedal_best[
+                                            "smoothing_window"
+                                        ],
+                                        "min_hold_steps": pedal_best["min_hold_steps"],
+                                        "shift": pedal_best["shift"],
+                                    },
+                                },
+                            )
+                except Exception as exc:
+                    txt_logger.loj(
+                        "PEDAL_VALIDATION_ERROR",
+                        {
+                            "epoch": epoch,
+                            "batch_idx": batch_idx,
+                            "global_step": global_step,
+                            "error": str(exc),
+                        },
+                    )
+                finally:
+                    cleanup_memory(verbose=False)
+                    model.train()
+                    keep_frozen_note_modules_eval()
+
+            # ##################################################################
             # # TRAINING
             # ##################################################################
             with torch.no_grad():
                 logmels = logmels.to(CONF.DEVICE)
-                rolls = rolls[:, :, 1:].to(CONF.DEVICE)
-                onsets = rolls[:, onsets_beg:onsets_end][:, key_beg:key_end]
+                rolls = rolls.to(CONF.DEVICE)
+                model_aligned_rolls = rolls[:, :, 1:]
+                onsets = model_aligned_rolls[:, onsets_beg:onsets_end][:, key_beg:key_end]
                 # frames = rolls[:, frames_beg:frames_end][:, key_beg:key_end]
 
                 sustain_pedal = rolls[
                     :, maestro_train.SUS_IDX : maestro_train.SUS_IDX + 1
                 ]
-                sustain_active = (
-                    sustain_pedal > MidiToPianoRoll.SUS_PEDAL_THRESH
-                ).float()
+                pedal_target_bundle = sustain_pedal_targets_from_values(
+                    sustain_pedal,
+                    threshold=MidiToPianoRoll.SUS_PEDAL_THRESH,
+                    transition_width=CONF.PEDAL_TRANSITION_TARGET_WIDTH,
+                    align_to_model_diff=True,
+                )
+                sustain_active = pedal_target_bundle.state
 
                 # ##############################################################
                 double_onsets = onsets.clone()
@@ -835,7 +1095,8 @@ if __name__ == "__main__":
             # Forward pass: returns onset_stages, velocities, and sustain pedal predictions
             keep_frozen_note_modules_eval()
             onset_stages, velocities, pedals = training_forward(logmels)
-            # Shapes: onset_stages: list of (b, 88, t), velocities: (b, 88, t), pedals: (b, 1, t)
+            # Shapes: onset_stages: list of (b, 88, t), velocities: (b, 88, t),
+            # pedals: (b, 3, t) with sustain [state, onset/down, offset/up]
 
             if CONF.PEDAL_ONLY_FINETUNE:
                 with torch.no_grad():
@@ -854,29 +1115,51 @@ if __name__ == "__main__":
                     velocities, onsets_norm, mask=onsets_clip
                 )
 
-            pedal_logits = pedals.reshape(-1)
-            pedal_targets = sustain_active.reshape(-1)
-            pedal_weights = torch.ones_like(pedal_targets)
             pedal_frame_targets = sustain_active.squeeze(1)
-            pedal_transition_mask = torch.abs(
-                pedal_frame_targets[:, 1:] - pedal_frame_targets[:, :-1]
-            )
+            pedal_transition_mask = torch.maximum(
+                pedal_target_bundle.onset, pedal_target_bundle.offset
+            ).squeeze(1)
+            pedal_state_logits = pedals[:, model.PEDAL_STATE_IDX:model.PEDAL_STATE_IDX + 1]
+            pedal_targets = sustain_active
+            pedal_weights = torch.ones_like(pedal_targets)
             if pedal_transition_mask.numel() > 0:
                 pedal_transition_weights = torch.ones_like(pedal_frame_targets)
-                pedal_transition_weights[:, 1:] += (
+                pedal_transition_weights += (
                     CONF.PEDAL_TRANSITION_WEIGHT - 1.0
                 ) * pedal_transition_mask
-                pedal_weights = pedal_transition_weights.reshape(-1)
-            pedal_loss = (
+                pedal_weights = pedal_transition_weights.unsqueeze(1)
+            pedal_state_loss = (
                 CONF.PEDAL_LOSS_LAMBDA
                 * torch.nn.functional.binary_cross_entropy_with_logits(
-                    pedal_logits,
+                    pedal_state_logits,
                     pedal_targets,
                     pos_weight=pedal_pos_weight,
                     reduction="none",
                 )
             )
-            pedal_loss = (pedal_loss * pedal_weights).mean()
+            pedal_state_loss = (pedal_state_loss * pedal_weights).mean()
+
+            pedal_onset_loss = torch.zeros((), device=CONF.DEVICE)
+            pedal_offset_loss = torch.zeros((), device=CONF.DEVICE)
+            if pedals.shape[1] >= model.PEDAL_NUM_OUTPUTS:
+                event_pos_weight = torch.FloatTensor(
+                    [CONF.PEDAL_EVENT_POSITIVES_WEIGHT]
+                ).to(CONF.DEVICE)
+                pedal_onset_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                    pedals[:, model.PEDAL_ONSET_IDX:model.PEDAL_ONSET_IDX + 1],
+                    pedal_target_bundle.onset,
+                    pos_weight=event_pos_weight,
+                )
+                pedal_offset_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                    pedals[:, model.PEDAL_OFFSET_IDX:model.PEDAL_OFFSET_IDX + 1],
+                    pedal_target_bundle.offset,
+                    pos_weight=event_pos_weight,
+                )
+
+            pedal_event_loss = CONF.PEDAL_EVENT_LOSS_LAMBDA * (
+                pedal_onset_loss + pedal_offset_loss
+            )
+            pedal_loss = pedal_state_loss + pedal_event_loss
 
             loss = pedal_loss if CONF.PEDAL_ONLY_FINETUNE else vel_loss + pedal_loss
             if CONF.TRAINABLE_ONSETS and not CONF.PEDAL_ONLY_FINETUNE:
@@ -916,7 +1199,12 @@ if __name__ == "__main__":
                     "vel": vel_loss.item(),
                     "ons": ons_loss.item() if "ons_loss" in locals() else None,
                 }
-                logged_losses = {"pedal": pedal_loss.item()}
+                logged_losses = {
+                    "pedal": pedal_loss.item(),
+                    "pedal_state": pedal_state_loss.item(),
+                    "pedal_onset": pedal_onset_loss.item(),
+                    "pedal_offset": pedal_offset_loss.item(),
+                }
                 if not CONF.PEDAL_ONLY_FINETUNE:
                     logged_losses["vel"] = vel_loss.item()
                     logged_losses["ons"] = note_monitor_losses["ons"]

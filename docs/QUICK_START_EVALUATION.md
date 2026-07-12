@@ -54,6 +54,35 @@ python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=full SNAPSHOT_INPATH
 
 > **Important:** `quick` and `low_memory` still evaluate the test split, but their thresholds are selected from a shortened validation split. Treat those results as diagnostic only. Rerun with `EVALUATION_PRESET=full` before publishing or comparing final metrics.
 
+### Resuming Interrupted Evaluation
+
+Evaluation checkpoints are enabled by default. The scripts save resumable stage
+checkpoints under `out/eval_checkpoints/` after each successfully processed file
+or completed grid-search combination:
+
+- `03_evaluate_pedal_model.py` checkpoints validation inference, note grid search,
+  pedal grid search, and final test metrics.
+- `04_evaluate_test_split.py` checkpoints test inference and test grid summaries.
+
+If a run is interrupted, rerun the same command and matching checkpoints will be
+loaded automatically. Checkpoints are fingerprinted from the model snapshot, data
+paths, split/file list, decoder settings, thresholds, and tolerance settings, so
+changing evaluation-relevant options creates a separate checkpoint file instead
+of mixing stale results.
+
+Useful overrides:
+
+```bash
+# Disable evaluation resume/checkpointing for one run
+python scripts/03_evaluate_pedal_model.py EVALUATION_CHECKPOINTS_ENABLED=false
+
+# Force recomputation for the current command/fingerprint
+python scripts/03_evaluate_pedal_model.py RESET_EVALUATION_CHECKPOINTS=true
+
+# Store checkpoint files somewhere else
+python scripts/03_evaluate_pedal_model.py EVALUATION_CHECKPOINT_DIR="out/eval_checkpoints_full_run"
+```
+
 ## Step 3: Check Results
 Results will be printed to console and saved to `out/txt_logs/`
 

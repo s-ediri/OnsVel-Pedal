@@ -14,6 +14,8 @@ including:
 """
 
 
+import hashlib
+import json
 import os
 import numpy as np
 import pandas as pd
@@ -24,6 +26,180 @@ from mir_eval.transcription_velocity import precision_recall_f1_overlap \
 from .data.key_model import KeyboardStateMachine
 from .data.midi import MidiToPianoRoll, MaestroMidiParser, SingletrackMidiParser
 from .inference import PedalDecoder
+
+
+# ##############################################################################
+# # EVALUATION CHECKPOINTS
+# ##############################################################################
+EVAL_CHECKPOINT_VERSION = 1
+
+
+def _json_default(value):
+    """Convert common scientific-Python objects to stable JSON values."""
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.ndarray,)):
+        return value.tolist()
+    if isinstance(value, (tuple, set)):
+        return list(value)
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return str(value)
+
+
+def evaluation_fingerprint(config):
+    """Return a short stable hash for an evaluation checkpoint configuration.
+
+    The fingerprint is used to avoid accidentally resuming cached inference or
+    metrics from a different model, dataset, split, decoder setup, or threshold
+    search.  ``config`` should contain only values that affect the cached stage.
+    """
+    payload = json.dumps(config, sort_keys=True, default=_json_default)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def metadata_to_file_id(metadata):
+    """Return a stable per-piece identifier from MAESTRO/MAPS metadata."""
+    if isinstance(metadata, (list, tuple)) and len(metadata) > 0:
+        return str(metadata[0])
+    return str(metadata)
+
+
+def evaluation_checkpoint_path(checkpoint_dir, script_name, stage, fingerprint):
+    """Build a readable checkpoint path for a script/stage/fingerprint tuple."""
+    safe_script = "".join(
+        ch if ch.isalnum() or ch in ("-", "_", ".") else "_"
+        for ch in os.path.basename(str(script_name))
+    )
+    safe_stage = "".join(
+        ch if ch.isalnum() or ch in ("-", "_", ".") else "_"
+        for ch in str(stage)
+    )
+    return os.path.join(
+        checkpoint_dir,
+        f"{safe_script}.{safe_stage}.{fingerprint}.pt",
+    )
+
+
+def _torch_load_checkpoint(path):
+    """Load a checkpoint payload across PyTorch versions.
+
+    PyTorch 2.6 changed ``torch.load`` defaults toward ``weights_only=True``.
+    Evaluation checkpoints intentionally store Pandas dataframes and other Python
+    objects, so they must be loaded as trusted local artifacts.
+    """
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+class EvaluationCheckpointStore:
+    """Small append/update store for resumable evaluation stages.
+
+    Each stage stores a dictionary of per-file entries under one atomic ``.pt``
+    file.  Entries can contain Pandas dataframes and CPU tensors, which makes the
+    helper suitable for persisting expensive full-file inference outputs or final
+    per-file metrics after each successfully processed piece.
+    """
+
+    def __init__(self, path, fingerprint, stage, enabled=True, reset=False,
+                 logger=None):
+        self.path = os.fspath(path)
+        self.fingerprint = str(fingerprint)
+        self.stage = str(stage)
+        self.enabled = bool(enabled)
+        self.logger = logger
+        self.payload = {
+            "version": EVAL_CHECKPOINT_VERSION,
+            "stage": self.stage,
+            "fingerprint": self.fingerprint,
+            "items": {},
+        }
+
+        if not self.enabled:
+            return
+
+        out_dir = os.path.dirname(self.path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        if reset and os.path.isfile(self.path):
+            os.remove(self.path)
+            self._log(f"Reset evaluation checkpoint: {self.path}")
+
+        self._load_existing()
+
+    def _log(self, message):
+        if self.logger is not None:
+            self.logger(message)
+
+    def _load_existing(self):
+        if not os.path.isfile(self.path):
+            return
+        try:
+            payload = _torch_load_checkpoint(self.path)
+        except Exception as exc:
+            self._log(
+                f"Ignoring unreadable evaluation checkpoint {self.path}: {exc}"
+            )
+            return
+
+        if not isinstance(payload, dict):
+            self._log(f"Ignoring malformed evaluation checkpoint {self.path}")
+            return
+        if payload.get("version") != EVAL_CHECKPOINT_VERSION:
+            self._log(
+                f"Ignoring evaluation checkpoint with incompatible version: "
+                f"{self.path}"
+            )
+            return
+        if payload.get("stage") != self.stage:
+            self._log(f"Ignoring evaluation checkpoint for another stage: {self.path}")
+            return
+        if payload.get("fingerprint") != self.fingerprint:
+            self._log(
+                f"Ignoring stale evaluation checkpoint with different fingerprint: "
+                f"{self.path}"
+            )
+            return
+
+        items = payload.get("items", {})
+        if not isinstance(items, dict):
+            self._log(f"Ignoring evaluation checkpoint with invalid items: {self.path}")
+            return
+        self.payload = payload
+        self._log(
+            f"Loaded evaluation checkpoint {self.path} "
+            f"({len(self.payload['items'])} item(s))"
+        )
+
+    def __len__(self):
+        return len(self.payload["items"])
+
+    def get(self, file_id, default=None):
+        return self.payload["items"].get(str(file_id), default)
+
+    def contains(self, file_id):
+        return str(file_id) in self.payload["items"]
+
+    def items(self):
+        return self.payload["items"].items()
+
+    def upsert(self, file_id, entry):
+        """Persist ``entry`` for ``file_id`` and atomically flush to disk."""
+        if not self.enabled:
+            return None
+        self.payload["items"][str(file_id)] = entry
+        tmp_path = self.path + ".tmp"
+        torch.save(self.payload, tmp_path)
+        os.replace(tmp_path, self.path)
+        return self.path
 
 
 # ##############################################################################
@@ -290,6 +466,18 @@ def eval_sus_pedal_simple(gt_events_df, pred_events_df, tol_secs=0.05):
     return precision, recall, f1
 
 
+def _infer_logical_pedal_count(num_channels):
+    """Infer logical pedals from prediction channels.
+
+    A single sustain pedal can now be represented by three channels
+    ``[state, onset, offset]``.  Legacy state-only predictions still use one
+    channel per pedal.
+    """
+    if num_channels > 1 and (num_channels % 3) == 0:
+        return num_channels // 3
+    return num_channels
+
+
 def _empty_pedal_results(num_pedals=1):
     pedal_names = ["sustain", "soft", "tenuto"][:num_pedals]
     results = {
@@ -323,29 +511,46 @@ def _prepare_pedal_data(pred_pedal_probs):
 
     return pred_pedal_probs
 
-def _decode_pedal_predictions(pred_pedal_probs, thresh):
-    num_pedals = pred_pedal_probs.shape[1]
+def _decode_pedal_predictions(pred_pedal_probs, thresh, hysteresis=0.1,
+                              min_hold_steps=2, smoothing_window=3):
+    num_pedals = _infer_logical_pedal_count(pred_pedal_probs.shape[1])
     if num_pedals < 1:
         return None
 
     try:
-        decoder = PedalDecoder(num_pedals=num_pedals, threshold=thresh)
+        decoder = PedalDecoder(
+            num_pedals=num_pedals,
+            threshold=thresh,
+            hysteresis=hysteresis,
+            min_hold_steps=min_hold_steps,
+            smoothing_window=smoothing_window,
+        )
         events_df, _, _ = decoder(pred_pedal_probs)
         return events_df
     except ValueError:
         return None
 
-def threshold_eval_pedals(gt_pedal_events, pred_pedal_probs, secs_per_frame, thresh=0.5, shift_preds=0, tol_secs=0.05):
+def threshold_eval_pedals(
+        gt_pedal_events, pred_pedal_probs, secs_per_frame, thresh=0.5,
+        shift_preds=0, tol_secs=0.05, hysteresis=0.1,
+        min_hold_steps=2, smoothing_window=3):
     pred_pedal_probs = _prepare_pedal_data(pred_pedal_probs)
-    events_df = _decode_pedal_predictions(pred_pedal_probs, thresh)
+    logical_pedals = _infer_logical_pedal_count(pred_pedal_probs.shape[1])
+    events_df = _decode_pedal_predictions(
+        pred_pedal_probs,
+        thresh,
+        hysteresis=hysteresis,
+        min_hold_steps=min_hold_steps,
+        smoothing_window=smoothing_window,
+    )
 
     if events_df is None:
-        return _empty_pedal_results(pred_pedal_probs.shape[1])
+        return _empty_pedal_results(logical_pedals)
 
     if "t_idx" in events_df.columns:
         events_df["onset"] = (events_df["t_idx"].astype(float) * float(secs_per_frame)) + float(shift_preds)
 
-    pedal_names = ["sustain", "soft", "tenuto"][:pred_pedal_probs.shape[1]]
+    pedal_names = ["sustain", "soft", "tenuto"][:logical_pedals]
     results = {}
 
     for pedal_idx, pedal_name in enumerate(pedal_names):
@@ -374,3 +579,116 @@ def threshold_eval_pedals(gt_pedal_events, pred_pedal_probs, secs_per_frame, thr
     results["macro_avg"] = {"precision": avg_prec, "recall": avg_rec, "f1": avg_f1}
 
     return results
+
+
+def pedal_grid_search(
+        pedal_eval_items, secs_per_frame, thresholds, hysteresis_values,
+        smoothing_windows, min_hold_steps_values, shifts, tol_secs=0.05,
+        logger=None, log_prefix="XV pedal", max_logged_items=None,
+        checkpoint_store=None):
+    """Grid-search sustain-pedal decoder hyperparameters.
+
+    :param pedal_eval_items: Iterable of ``(gt_pedal_events, pred_pedal_probs)``
+      pairs.  Predictions are usually cached tensors returned by model inference.
+    :param secs_per_frame: Seconds represented by one prediction frame.
+    :param thresholds: Activation/event thresholds to evaluate.
+    :param hysteresis_values: Hysteresis margins to evaluate.
+    :param smoothing_windows: Moving-average smoothing windows to evaluate.
+    :param min_hold_steps_values: Minimum hold durations, in frames, to evaluate.
+    :param shifts: Prediction time shifts, in seconds, to evaluate.
+    :param tol_secs: Event matching tolerance, in seconds.
+    :param logger: Optional callable receiving progress strings.
+    :param log_prefix: Prefix for optional progress messages.
+    :param max_logged_items: If set, only log the first N files per combo to
+      avoid very large logs during full validation searches.
+    :param checkpoint_store: Optional ``EvaluationCheckpointStore`` used to
+      persist one summary metric vector per hyperparameter combination.
+    :returns: ``(summary, best_params, best_metrics)`` where ``summary`` maps
+      ``(threshold, hysteresis, smoothing_window, min_hold_steps, shift)`` to
+      ``np.array([precision, recall, f1])``.
+    """
+    pedal_eval_items = list(pedal_eval_items)
+    summary = {}
+
+    for thresh in thresholds:
+        for hysteresis in hysteresis_values:
+            for smoothing_window in smoothing_windows:
+                for min_hold_steps in min_hold_steps_values:
+                    for shift in shifts:
+                        key = (
+                            float(thresh),
+                            float(hysteresis),
+                            int(smoothing_window),
+                            int(min_hold_steps),
+                            float(shift),
+                        )
+                        checkpoint_key = json.dumps(key)
+                        cached = (
+                            checkpoint_store.get(checkpoint_key)
+                            if checkpoint_store is not None else None
+                        )
+                        if isinstance(cached, dict) and cached.get("status") == "ok":
+                            summary[key] = np.asarray(cached["metrics"], dtype=float)
+                            if logger is not None:
+                                logger(f"{log_prefix} checkpoint hit for {key}")
+                            continue
+
+                        metrics = []
+                        for idx, (gt_pedal_df, pedal_pred) in enumerate(pedal_eval_items, 1):
+                            if logger is not None and (
+                                max_logged_items is None or idx <= max_logged_items
+                            ):
+                                logger(
+                                    f"[{idx}/{len(pedal_eval_items)} {log_prefix}]: "
+                                    f"threshold={key[0]}, hysteresis={key[1]}, "
+                                    f"smoothing_window={key[2]}, min_hold_steps={key[3]}, "
+                                    f"shift={key[4]}"
+                                )
+                            try:
+                                pedal_results = threshold_eval_pedals(
+                                    gt_pedal_df,
+                                    pedal_pred,
+                                    secs_per_frame,
+                                    thresh=key[0],
+                                    shift_preds=key[4],
+                                    tol_secs=tol_secs,
+                                    hysteresis=key[1],
+                                    smoothing_window=key[2],
+                                    min_hold_steps=key[3],
+                                )
+                                sustain = pedal_results.get("sustain")
+                                if sustain is None:
+                                    pedal_prf1 = (0.0, 0.0, 0.0)
+                                else:
+                                    pedal_prf1 = (
+                                        sustain["precision"],
+                                        sustain["recall"],
+                                        sustain["f1"],
+                                    )
+                            except Exception as exc:
+                                if logger is not None:
+                                    logger(f"{log_prefix} eval failed for {key}: {exc}")
+                                pedal_prf1 = (0.0, 0.0, 0.0)
+                            metrics.append(pedal_prf1)
+
+                        if len(metrics) == 0:
+                            summary[key] = np.array([0.0, 0.0, 0.0])
+                        else:
+                            arr = np.asarray(metrics, dtype=float)
+                            summary[key] = arr.mean(axis=0)
+
+                        if checkpoint_store is not None:
+                            checkpoint_store.upsert(
+                                checkpoint_key,
+                                {
+                                    "status": "ok",
+                                    "params": key,
+                                    "metrics": summary[key].tolist(),
+                                },
+                            )
+
+    if len(summary) == 0:
+        return summary, None, np.array([0.0, 0.0, 0.0])
+
+    best_params, best_metrics = max(summary.items(), key=lambda elt: elt[1][2])
+    return summary, best_params, best_metrics

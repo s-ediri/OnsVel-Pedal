@@ -1,8 +1,6 @@
 
 document.addEventListener("DOMContentLoaded", () => {
-    // --- Upload limits (kept in sync with web_app/app.py AppConfig) ---
-    const MAX_AUDIO_FILE_SIZE_BYTES = 25 * 1024 * 1024;
-    const MAX_AUDIO_FILE_SIZE_LABEL = "25MB";
+    // --- Supported upload types ---
     const SUPPORTED_AUDIO_EXTENSIONS = [
         ".aac",
         ".aif",
@@ -34,7 +32,6 @@ document.addEventListener("DOMContentLoaded", () => {
     const canvas = document.getElementById("piano-roll-canvas");
     const ctx = canvas.getContext("2d");
     const pianoRollContainer = canvas.parentElement;
-    const notationPreviewContainer = document.getElementById("notation-preview-container");
     const dropZone = document.getElementById("drop-zone");
     const uploadFileLabel = document.querySelector("label[for='audio-file']");
 
@@ -68,10 +65,17 @@ document.addEventListener("DOMContentLoaded", () => {
     let recordingChunks = [];
     let timerInterval;
     let transcriptionData = null;
-    let visualObj;
     let isTranscribing = false;
     let currentRequest = null;
     let playbackSynth = null;
+    let playbackAnimationRequest = null;
+    let playbackState = "stopped";
+    let playbackMode = "none";
+    let playbackPosition = 0;
+    let playbackDuration = 0;
+    let synthPlaybackClockStartTime = 0;
+    let audioElement = null;
+    let audioObjectUrl = null;
     let pianoRollSpacer = null;
     let pianoRollFrameRequest = null;
     let pianoRollState = null;
@@ -82,7 +86,8 @@ document.addEventListener("DOMContentLoaded", () => {
     const PIANO_ROLL_PX_PER_SECOND = 50;
     const PIANO_ROLL_MAX_BACKING_WIDTH = 2400;
     const PIANO_ROLL_RESIZE_DEBOUNCE_MS = 100;
-    const APPROXIMATE_PREVIEW_MAX_NOTES = 512;
+    const PIANO_ROLL_PEDAL_LANE_HEIGHT = 42;
+    const PLAYHEAD_COLOR = "#f97316";
 
     // --- Initialization ---
     const init = async () => {
@@ -179,7 +184,8 @@ document.addEventListener("DOMContentLoaded", () => {
         stopBtn.addEventListener("click", stopRecording);
         transcribeBtn.addEventListener("click", handleTranscribe);
         cancelBtn.addEventListener("click", cancelTranscription);
-        playBtn.addEventListener("click", playTranscription);
+        playBtn.addEventListener("click", togglePlayback);
+        pianoRollContainer.addEventListener("click", handlePianoRollSeek);
         pianoRollContainer.addEventListener("scroll", requestPianoRollRender);
         window.addEventListener("resize", handlePianoRollResize);
 
@@ -227,6 +233,9 @@ document.addEventListener("DOMContentLoaded", () => {
         }
 
         audioBlob = file;
+        prepareAudioPlaybackSource(file);
+        transcriptionData = null;
+        resultsDiv.style.display = "none";
         fileNameSpan.textContent = `${file.name} (${formatBytes(file.size)})`;
         updateStatus("Audio file ready. Select a model and transcribe.", "info");
         checkTranscribeButtonState();
@@ -281,16 +290,76 @@ document.addEventListener("DOMContentLoaded", () => {
 
     function clearSelectedAudio() {
         audioBlob = null;
+        transcriptionData = null;
+        clearAudioPlaybackSource();
+        resultsDiv.style.display = "none";
         audioFileInput.value = "";
         fileNameSpan.textContent = " or drag and drop an audio file here";
         checkTranscribeButtonState();
     }
 
-    function validateAudioFile(file) {
-        if (file.size > MAX_AUDIO_FILE_SIZE_BYTES) {
-            return `File is too large (${formatBytes(file.size)}). Maximum allowed size is ${MAX_AUDIO_FILE_SIZE_LABEL}.`;
+    function prepareAudioPlaybackSource(blob) {
+        stopPlayback(true);
+        clearAudioPlaybackSource(false);
+
+        if (!blob) return;
+
+        audioObjectUrl = URL.createObjectURL(blob);
+        audioElement = new Audio(audioObjectUrl);
+        audioElement.preload = "metadata";
+        audioElement.addEventListener("ended", handleSourceAudioEnded);
+        audioElement.addEventListener("loadedmetadata", handleSourceAudioMetadataLoaded);
+        audioElement.addEventListener("error", () => {
+            console.warn("Uploaded audio could not be loaded for synchronized playback.");
+        });
+        updatePlayButton();
+    }
+
+    function clearAudioPlaybackSource(stopExistingPlayback = true) {
+        if (stopExistingPlayback) {
+            stopPlayback(true);
         }
 
+        if (audioElement) {
+            audioElement.pause();
+            audioElement.removeAttribute("src");
+            audioElement.load();
+            audioElement = null;
+        }
+
+        if (audioObjectUrl) {
+            URL.revokeObjectURL(audioObjectUrl);
+            audioObjectUrl = null;
+        }
+        updatePlayButton();
+    }
+
+    function hasPlayableSourceAudio() {
+        return Boolean(audioElement && audioObjectUrl);
+    }
+
+    function handleSourceAudioEnded() {
+        if (playbackMode !== "audio") return;
+        stopPlayback(true);
+    }
+
+    function handleSourceAudioMetadataLoaded() {
+        if (!transcriptionData || !pianoRollState) return;
+        playbackDuration = getVisualizationDuration(
+            transcriptionData.notes,
+            transcriptionData.pedals,
+            transcriptionData.duration
+        );
+        drawPianoRoll(
+            transcriptionData.notes,
+            transcriptionData.pedals,
+            playbackDuration,
+            false
+        );
+        updatePlayButton();
+    }
+
+    function validateAudioFile(file) {
         if (!isAudioFile(file)) {
             return `Unsupported file type. Please choose an audio file (${SUPPORTED_AUDIO_EXTENSIONS.join(", ")}).`;
         }
@@ -330,6 +399,9 @@ document.addEventListener("DOMContentLoaded", () => {
             mediaRecorder.onstop = () => {
                 audioBlob = new Blob(recordingChunks, { type: "audio/webm" });
                 recordingChunks = [];
+                prepareAudioPlaybackSource(audioBlob);
+                transcriptionData = null;
+                resultsDiv.style.display = "none";
                 fileNameSpan.textContent = `recording_${new Date().toISOString()}.webm`;
                 stream.getTracks().forEach((track) => track.stop()); // Stop mic access
                 checkTranscribeButtonState();
@@ -393,6 +465,7 @@ document.addEventListener("DOMContentLoaded", () => {
         setBusyState(true);
         hideProgress();
         updateStatus("Preparing upload...", "loading");
+        stopPlayback(true);
         resultsDiv.style.display = "none";
 
         const formData = new FormData();
@@ -478,172 +551,374 @@ document.addEventListener("DOMContentLoaded", () => {
     function displayResults(data) {
         try {
             resultsDiv.style.display = "block";
+            resetPlaybackForResults(data);
             drawPianoRoll(data.notes, data.pedals, data.duration);
-            renderApproximatePitchPreview(data.notes);
         } catch (error) {
             console.error("Error displaying results:", error);
             updateStatus(`Error displaying results: ${error.message}`, "error");
         }
     }
 
-    function renderApproximatePitchPreview(notes) {
-        notationPreviewContainer.innerHTML = "";
+    async function togglePlayback() {
+        if (!transcriptionData || !Array.isArray(transcriptionData.notes)) return;
 
-        if (!Array.isArray(notes) || notes.length === 0) {
-            notationPreviewContainer.textContent = "No detected notes to preview.";
-            visualObj = null;
+        if (playbackState === "playing") {
+            pausePlayback();
             return;
         }
-
-        const previewableNotes = getPreviewableNotes(notes);
-
-        if (previewableNotes.length === 0) {
-            notationPreviewContainer.textContent = "No valid detected notes to preview.";
-            visualObj = null;
-            return;
-        }
-
-        if (!window.ABCJS || typeof ABCJS.renderAbc !== "function") {
-            notationPreviewContainer.textContent = "Approximate pitch preview is unavailable because ABCJS did not load.";
-            visualObj = null;
-            return;
-        }
-
-        const renderedNotes = previewableNotes.slice(0, APPROXIMATE_PREVIEW_MAX_NOTES);
-        const abcString = notesToApproximateAbc(renderedNotes);
-
-        try {
-            visualObj = ABCJS.renderAbc(notationPreviewContainer, abcString, {
-                responsive: "resize",
-            })[0] || null;
-        } catch (error) {
-            console.error("Approximate pitch preview render failed:", error);
-            notationPreviewContainer.textContent = "Approximate pitch preview could not be rendered.";
-            visualObj = null;
-            return;
-        }
-
-        if (previewableNotes.length > renderedNotes.length) {
-            const truncationNote = document.createElement("p");
-            truncationNote.className = "preview-truncation-note";
-            truncationNote.textContent = `Preview truncated: showing first ${renderedNotes.length} of ${previewableNotes.length} detected notes.`;
-            notationPreviewContainer.appendChild(truncationNote);
-        }
-    }
-
-    function getPreviewableNotes(notes) {
-        return notes
-            .filter((note) => isFiniteNote(note) && isValidMidiPitch(note.pitch))
-            .sort((a, b) => Number(a.start) - Number(b.start) || Number(a.pitch) - Number(b.pitch));
-    }
-
-    function notesToApproximateAbc(notes) {
-        let abc = "X:1\nT:Approximate Pitch Preview (Not Quantized Sheet Music)\nM:none\nL:1/8\nK:C\n";
-        const tokens = [];
-
-        notes
-            .forEach((note) => {
-                tokens.push(midiPitchToApproximateAbc(Number(note.pitch)));
-            });
-
-        if (tokens.length === 0) {
-            return `${abc}z8`;
-        }
-
-        const lines = [];
-        for (let i = 0; i < tokens.length; i += 32) {
-            lines.push(tokens.slice(i, i + 32).join(" "));
-        }
-
-        return abc + lines.join("\n");
-    }
-
-    function midiPitchToApproximateAbc(midiPitch) {
-        const pitchClasses = ["C", "^C", "D", "^D", "E", "F", "^F", "G", "^G", "A", "^A", "B"];
-        const roundedPitch = Math.round(Number(midiPitch));
-        const pitchClass = pitchClasses[((roundedPitch % 12) + 12) % 12];
-        const octave = Math.floor(roundedPitch / 12) - 1;
-        const abcBaseOctave = 4;
-        const octaveDelta = octave - abcBaseOctave;
-
-        if (octaveDelta > 0) {
-            return pitchClass.toLowerCase() + "'".repeat(Math.max(0, octaveDelta - 1));
-        }
-
-        if (octaveDelta < 0) {
-            return pitchClass + ",".repeat(Math.abs(octaveDelta));
-        }
-
-        return pitchClass;
-    }
-
-    function isValidMidiPitch(pitch) {
-        const numericPitch = Number(pitch);
-        return Number.isFinite(numericPitch) && numericPitch >= 0 && numericPitch <= 127;
-    }
-
-    async function playTranscription() {
-        if (!transcriptionData || !transcriptionData.notes) return;
 
         playBtn.disabled = true;
         playBtn.textContent = "Starting audio...";
 
         try {
-            // Browser autoplay policies require AudioContext startup from a user gesture.
-            await Tone.start();
+            if (!hasPlayableSourceAudio()) {
+                if (typeof Tone === "undefined") {
+                    throw new Error("Tone.js is not available for synthesized transcription playback.");
+                }
+                // Browser autoplay policies require AudioContext startup from a user gesture.
+                await Tone.start();
+            }
+
+            const notes = getPlayableNotes();
+            const duration = getVisualizationDuration(
+                transcriptionData.notes,
+                transcriptionData.pedals,
+                transcriptionData.duration
+            );
+            const startAt = playbackPosition >= duration ? 0 : playbackPosition;
+            await startPlaybackFrom(startAt, notes, duration);
         } catch (error) {
-            console.error("Tone.js audio start failed:", error);
-            updateStatus("Audio playback could not start. Click Play again or check browser audio permissions.", "error");
+            console.error("Playback start failed:", error);
+            updateStatus(`Audio playback could not start: ${error.message}`, "error");
+            updatePlayButton();
+        } finally {
             playBtn.disabled = false;
-            playBtn.textContent = "Play Transcription";
+        }
+    }
+
+    async function startPlaybackFrom(position, notes = getPlayableNotes(), duration = playbackDuration) {
+        const boundedDuration = Math.max(Number(duration) || 0, 0.01);
+        playbackDuration = boundedDuration;
+        playbackPosition = clamp(Number(position) || 0, 0, boundedDuration);
+
+        if (hasPlayableSourceAudio()) {
+            await startSourceAudioPlayback(playbackPosition, boundedDuration);
             return;
         }
 
-        stopPlayback();
+        startSynthPlaybackFrom(playbackPosition, notes, boundedDuration);
+    }
+
+    async function startSourceAudioPlayback(position, duration) {
+        stopPlayback(false, false);
+
+        playbackDuration = Math.max(Number(duration) || 0, 0.01);
+        playbackPosition = clamp(Number(position) || 0, 0, playbackDuration);
+        playbackMode = "audio";
+
+        await ensureSourceAudioMetadata();
+        seekSourceAudio(playbackPosition);
+
+        playbackState = "playing";
+        updatePlayButton();
+        keepPlaybackPositionInView(playbackPosition, true);
+        renderPianoRollViewport();
+        startPlaybackAnimation();
+
+        try {
+            await audioElement.play();
+        } catch (error) {
+            playbackState = "paused";
+            playbackMode = "none";
+            cancelPlaybackAnimation();
+            updatePlayButton();
+            renderPianoRollViewport();
+            throw error;
+        }
+    }
+
+    function startSynthPlaybackFrom(position, notes = getPlayableNotes(), duration = playbackDuration) {
+        const boundedDuration = Math.max(Number(duration) || 0, 0.01);
+        stopPlayback(false, false);
+
+        playbackDuration = boundedDuration;
+        playbackPosition = clamp(Number(position) || 0, 0, boundedDuration);
+        playbackMode = "synth";
+
+        if (typeof Tone === "undefined") {
+            throw new Error("Tone.js is not available for synthesized transcription playback.");
+        }
 
         playbackSynth = new Tone.PolySynth(Tone.Synth, {
             oscillator: { type: "sine" },
             envelope: { attack: 0.01, decay: 0.1, sustain: 0.3, release: 1 },
         }).toDestination();
 
-        const notes = transcriptionData.notes.filter((note) => isFiniteNote(note));
-        const duration = Math.max(Number(transcriptionData.duration) || 0, getLastNoteEnd(notes));
-
-        Tone.Transport.seconds = 0;
-        Tone.Transport.bpm.value = 120;
+        const scheduleNow = Tone.now();
+        synthPlaybackClockStartTime = scheduleNow - playbackPosition;
 
         notes.forEach((note) => {
-            Tone.Transport.schedule((time) => {
-                playbackSynth.triggerAttackRelease(
-                    Tone.Frequency(note.pitch, "midi"),
-                    Math.max(0.01, Number(note.duration) || 0.01),
-                    time,
-                    clamp(Number(note.velocity) || 0.8, 0, 1)
-                );
-            }, Math.max(0, Number(note.start) || 0));
+            const noteStart = Math.max(0, Number(note.start) || 0);
+            const noteDuration = Math.max(0.01, Number(note.duration) || 0.01);
+            const noteEnd = noteStart + noteDuration;
+            if (noteEnd <= playbackPosition || noteStart > boundedDuration) return;
+
+            const offsetWithinNote = Math.max(0, playbackPosition - noteStart);
+            const remainingDuration = Math.max(
+                0.01,
+                Math.min(noteDuration - offsetWithinNote, boundedDuration - Math.max(noteStart, playbackPosition))
+            );
+            const scheduledTime = scheduleNow + Math.max(0, noteStart - playbackPosition);
+
+            playbackSynth.triggerAttackRelease(
+                Tone.Frequency(note.pitch, "midi"),
+                remainingDuration,
+                scheduledTime,
+                clamp(Number(note.velocity) || 0.8, 0, 1)
+            );
         });
 
-        Tone.Transport.scheduleOnce(() => {
-            stopPlayback(true);
-        }, duration + 1);
-
-        Tone.Transport.start("+0.05");
-        playBtn.disabled = false;
-        playBtn.textContent = "Restart Playback";
+        playbackState = "playing";
+        updatePlayButton();
+        keepPlaybackPositionInView(playbackPosition, true);
+        renderPianoRollViewport();
+        startPlaybackAnimation();
     }
 
-    function stopPlayback(resetButton = true) {
-        Tone.Transport.stop();
-        Tone.Transport.cancel(0);
+    function pausePlayback() {
+        if (playbackState !== "playing") return;
 
-        if (playbackSynth) {
-            playbackSynth.releaseAll(Tone.now());
-            playbackSynth.dispose();
-            playbackSynth = null;
+        playbackPosition = getCurrentPlaybackPosition();
+        if (playbackMode === "audio" && audioElement) {
+            audioElement.pause();
+        }
+        disposePlaybackSynth();
+
+        playbackState = "paused";
+        playbackMode = "none";
+        cancelPlaybackAnimation();
+        updatePlayButton();
+        renderPianoRollViewport();
+    }
+
+    function stopPlayback(resetButton = true, resetPosition = true) {
+        cancelPlaybackAnimation();
+
+        if (audioElement) {
+            audioElement.pause();
+            if (resetPosition) {
+                seekSourceAudio(0);
+            }
+        }
+
+        disposePlaybackSynth();
+        if (typeof Tone !== "undefined" && Tone.Transport) {
+            Tone.Transport.stop();
+            Tone.Transport.cancel(0);
+        }
+
+        playbackState = "stopped";
+        playbackMode = "none";
+        synthPlaybackClockStartTime = 0;
+        if (resetPosition) {
+            playbackPosition = 0;
         }
 
         if (resetButton) {
-            playBtn.textContent = "Play Transcription";
+            updatePlayButton();
+        }
+        renderPianoRollViewport();
+    }
+
+    function disposePlaybackSynth() {
+        if (!playbackSynth) return;
+
+        try {
+            const releaseTime = typeof Tone !== "undefined" ? Tone.now() : undefined;
+            playbackSynth.releaseAll(releaseTime);
+            playbackSynth.dispose();
+        } finally {
+            playbackSynth = null;
+        }
+    }
+
+    function ensureSourceAudioMetadata() {
+        if (!audioElement) return Promise.reject(new Error("No source audio is available for playback."));
+        if (Number.isFinite(audioElement.duration) || audioElement.readyState >= 1) {
+            return Promise.resolve();
+        }
+
+        return new Promise((resolve, reject) => {
+            const cleanup = () => {
+                audioElement.removeEventListener("loadedmetadata", handleLoaded);
+                audioElement.removeEventListener("error", handleError);
+            };
+            const handleLoaded = () => {
+                cleanup();
+                resolve();
+            };
+            const handleError = () => {
+                cleanup();
+                reject(new Error("Could not load the uploaded audio for playback."));
+            };
+
+            audioElement.addEventListener("loadedmetadata", handleLoaded);
+            audioElement.addEventListener("error", handleError);
+            audioElement.load();
+        });
+    }
+
+    function getSourceAudioDuration() {
+        return audioElement && Number.isFinite(audioElement.duration)
+            ? Math.max(0, audioElement.duration)
+            : 0;
+    }
+
+    function getSourceAudioSeekLimit() {
+        return getSourceAudioDuration() || Math.max(playbackDuration || 0, 0.01);
+    }
+
+    function seekSourceAudio(position) {
+        if (!audioElement) return;
+
+        try {
+            audioElement.currentTime = clamp(Number(position) || 0, 0, getSourceAudioSeekLimit());
+        } catch (error) {
+            console.debug("Could not seek source audio yet:", error);
+        }
+    }
+
+    function resetPlaybackForResults(data) {
+        stopPlayback(false);
+        playbackDuration = getVisualizationDuration(data.notes, data.pedals, data.duration);
+        playbackPosition = 0;
+        playbackState = "stopped";
+        updatePlayButton();
+    }
+
+    function startPlaybackAnimation() {
+        cancelPlaybackAnimation();
+
+        const animate = () => {
+            if (playbackState !== "playing") return;
+
+            playbackPosition = getCurrentPlaybackPosition();
+            if (playbackPosition >= playbackDuration) {
+                stopPlayback(true);
+                return;
+            }
+
+            keepPlaybackPositionInView(playbackPosition);
+            renderPianoRollViewport();
+            playbackAnimationRequest = window.requestAnimationFrame(animate);
+        };
+
+        playbackAnimationRequest = window.requestAnimationFrame(animate);
+    }
+
+    function cancelPlaybackAnimation() {
+        if (playbackAnimationRequest) {
+            window.cancelAnimationFrame(playbackAnimationRequest);
+            playbackAnimationRequest = null;
+        }
+    }
+
+    function getCurrentPlaybackPosition() {
+        if (playbackState !== "playing") {
+            return clamp(playbackPosition, 0, playbackDuration || 0);
+        }
+
+        if (playbackMode === "audio" && audioElement) {
+            return clamp(audioElement.currentTime || 0, 0, playbackDuration || 0);
+        }
+
+        if (playbackMode === "synth") {
+            if (typeof Tone === "undefined") {
+                return clamp(playbackPosition, 0, playbackDuration || 0);
+            }
+            return clamp(Tone.now() - synthPlaybackClockStartTime, 0, playbackDuration || 0);
+        }
+
+        return clamp(playbackPosition, 0, playbackDuration || 0);
+    }
+
+    function updatePlayButton() {
+        if (playbackState === "playing") {
+            playBtn.textContent = "Pause";
+        } else if (playbackState === "paused") {
+            playBtn.textContent = "Resume";
+        } else {
+            playBtn.textContent = hasPlayableSourceAudio()
+                ? "Play Audio + Tracker"
+                : "Play Transcription";
+        }
+    }
+
+    function getPlayableNotes() {
+        return transcriptionData && Array.isArray(transcriptionData.notes)
+            ? transcriptionData.notes.filter(isFiniteNote)
+            : [];
+    }
+
+    function handlePianoRollSeek(event) {
+        if (!pianoRollState) return;
+
+        const rect = pianoRollContainer.getBoundingClientRect();
+        if (event.clientY > rect.top + pianoRollState.height) return;
+
+        const xInViewport = clamp(event.clientX - rect.left, 0, pianoRollState.backingWidth);
+        const virtualX = clamp(
+            xInViewport + (pianoRollContainer.scrollLeft || 0),
+            0,
+            pianoRollState.virtualWidth
+        );
+        const targetTime = (virtualX / pianoRollState.virtualWidth) * pianoRollState.duration;
+        seekPlayback(targetTime);
+    }
+
+    function seekPlayback(targetTime) {
+        if (!pianoRollState) return;
+
+        playbackDuration = pianoRollState.duration;
+        playbackPosition = clamp(Number(targetTime) || 0, 0, playbackDuration);
+
+        if (playbackState === "playing") {
+            if (playbackMode === "audio" && audioElement) {
+                seekSourceAudio(playbackPosition);
+                keepPlaybackPositionInView(playbackPosition, true);
+                renderPianoRollViewport();
+            } else {
+                startSynthPlaybackFrom(playbackPosition, getPlayableNotes(), playbackDuration);
+            }
+            return;
+        }
+
+        if (audioElement) {
+            seekSourceAudio(playbackPosition);
+        }
+        keepPlaybackPositionInView(playbackPosition, true);
+        updatePlayButton();
+        renderPianoRollViewport();
+    }
+
+    function keepPlaybackPositionInView(currentTime, force = false) {
+        if (!pianoRollState) return;
+
+        const { duration, virtualWidth, backingWidth } = pianoRollState;
+        if (duration <= 0 || virtualWidth <= backingWidth) return;
+
+        const globalX = (currentTime / duration) * virtualWidth;
+        const scrollLeft = pianoRollContainer.scrollLeft || 0;
+        const rightEdge = scrollLeft + backingWidth;
+        const margin = Math.min(180, backingWidth * 0.2);
+        const maxScroll = Math.max(0, virtualWidth - backingWidth);
+
+        if (force && (globalX < scrollLeft || globalX > rightEdge)) {
+            pianoRollContainer.scrollLeft = clamp(globalX - backingWidth / 2, 0, maxScroll);
+        } else if (globalX > rightEdge - margin) {
+            pianoRollContainer.scrollLeft = clamp(globalX - backingWidth * 0.35, 0, maxScroll);
+        } else if (globalX < scrollLeft + margin) {
+            pianoRollContainer.scrollLeft = clamp(globalX - backingWidth * 0.15, 0, maxScroll);
         }
     }
 
@@ -660,12 +935,31 @@ document.addEventListener("DOMContentLoaded", () => {
         }, 0);
     }
 
+    function getLastPedalEnd(pedals) {
+        return pedals.reduce((lastEnd, pedal) => {
+            const end = (Number(pedal.start) || 0) + Math.max(0, Number(pedal.duration) || 0);
+            return Math.max(lastEnd, end);
+        }, 0);
+    }
+
+    function getVisualizationDuration(notes, pedals, duration) {
+        const safeNotes = Array.isArray(notes) ? notes.filter(isFiniteNote) : [];
+        const safePedals = Array.isArray(pedals) ? pedals : [];
+        return Math.max(
+            Number(duration) || 0,
+            getSourceAudioDuration(),
+            getLastNoteEnd(safeNotes),
+            getLastPedalEnd(safePedals),
+            1
+        );
+    }
+
     // --- Piano Roll Visualization ---
     function drawPianoRoll(notes, pedals, duration, resetScroll = true) {
         const minPitch = 21; // A0
         const maxPitch = 108; // C8
-        const pitchRange = maxPitch - minPitch;
-        const safeDuration = Math.max(Number(duration) || 0, getLastNoteEnd(notes || []), 1);
+        const pitchCount = maxPitch - minPitch + 1;
+        const safeDuration = getVisualizationDuration(notes || [], pedals || [], duration);
         const virtualWidth = Math.max(PIANO_ROLL_MIN_WIDTH, safeDuration * PIANO_ROLL_PX_PER_SECOND);
         const viewportWidth = Math.max(
             PIANO_ROLL_MIN_WIDTH,
@@ -689,7 +983,7 @@ document.addEventListener("DOMContentLoaded", () => {
             duration: safeDuration,
             minPitch,
             maxPitch,
-            pitchRange,
+            pitchCount,
             virtualWidth,
             backingWidth,
             height,
@@ -709,7 +1003,7 @@ document.addEventListener("DOMContentLoaded", () => {
         }
 
         pianoRollSpacer.style.width = `${width}px`;
-        pianoRollSpacer.style.height = "1px";
+        pianoRollSpacer.style.height = "0";
     }
 
     function handlePianoRollResize() {
@@ -744,7 +1038,7 @@ document.addEventListener("DOMContentLoaded", () => {
             duration,
             minPitch,
             maxPitch,
-            pitchRange,
+            pitchCount,
             virtualWidth,
             backingWidth,
             height,
@@ -755,8 +1049,9 @@ document.addEventListener("DOMContentLoaded", () => {
         const startTime = (scrollLeft / virtualWidth) * duration;
         const endTime = ((scrollLeft + visibleWidth) / virtualWidth) * duration;
 
-        const keyHeight = height / pitchRange;
-        const pedalHeight = 20;
+        const pedalHeight = PIANO_ROLL_PEDAL_LANE_HEIGHT;
+        const noteAreaHeight = height - pedalHeight;
+        const keyHeight = noteAreaHeight / pitchCount;
 
         // Clear canvas
         ctx.fillStyle = "white";
@@ -769,21 +1064,61 @@ document.addEventListener("DOMContentLoaded", () => {
         ctx.font = "12px sans-serif";
 
         for (let p = minPitch; p <= maxPitch; p++) {
-            const y = height - (p - minPitch) * keyHeight;
-            if ((p - 21) % 12 === 0) {
-                // C notes
+            const y = noteAreaHeight - (p - minPitch) * keyHeight;
+            if (p % 12 === 0) {
+                // True C notes only. A0 is the lowest piano key, so no extra bottom C row is shown.
                 ctx.beginPath();
                 ctx.moveTo(0, y);
                 ctx.lineTo(backingWidth, y);
                 ctx.stroke();
-                ctx.fillText(`C${Math.floor(p / 12) - 1}`, 5, y - 5);
+                ctx.fillText(`C${Math.floor(p / 12) - 1}`, 5, clamp(y - 5, 12, noteAreaHeight - 2));
             }
         }
 
         drawTimeTicks(startTime, endTime, duration, virtualWidth, scrollLeft, backingWidth);
 
-        // Draw pedals
-        ctx.fillStyle = "rgba(0, 123, 255, 0.2)";
+        drawPedalLane(pedals, startTime, endTime, duration, virtualWidth, scrollLeft, backingWidth, height, pedalHeight);
+
+        // Draw note onsets. The current model predicts onset/velocity only, so
+        // durations are treated as short visual extents unless explicitly marked
+        // as real by the backend.
+        notes.forEach((note) => {
+            const noteStart = Number(note.start) || 0;
+            const noteDuration = Math.max(0, Number(note.duration) || 0);
+            const hasEstimatedDuration = note.duration_estimated === true;
+            const noteEnd = noteStart + (hasEstimatedDuration ? Math.max(0.05, noteDuration) : noteDuration);
+            if (hasEstimatedDuration) {
+                if (noteStart < startTime || noteStart > endTime) return;
+            } else if (noteEnd < startTime || noteStart > endTime) {
+                return;
+            }
+            if (note.pitch < minPitch || note.pitch > maxPitch) return;
+
+            const y = noteAreaHeight - (note.pitch - minPitch) * keyHeight;
+            const x = (noteStart / duration) * virtualWidth - scrollLeft;
+            const w = hasEstimatedDuration
+                ? Math.max(2, Math.min(6, keyHeight * 1.5))
+                : Math.max(1, (noteDuration / duration) * virtualWidth);
+
+            ctx.fillStyle = `rgba(0, 0, 0, ${clamp(Number(note.velocity) || 0.8, 0, 1) * 0.8 + 0.2})`;
+            ctx.fillRect(x, y - keyHeight, w, keyHeight);
+        });
+
+        drawPlaybackIndicator(duration, virtualWidth, scrollLeft, backingWidth, height);
+    }
+
+    function drawPedalLane(pedals, startTime, endTime, duration, virtualWidth, scrollLeft, backingWidth, height, pedalHeight) {
+        const laneTop = height - pedalHeight;
+
+        // Pedal lane background and label
+        ctx.fillStyle = "#eef6ff";
+        ctx.fillRect(0, laneTop, backingWidth, pedalHeight);
+        ctx.fillStyle = "#1e3a8a";
+        ctx.font = "bold 12px sans-serif";
+        ctx.fillText("Sustain pedal", 8, laneTop + 15);
+
+        // Sustain-held intervals
+        ctx.fillStyle = "rgba(37, 99, 235, 0.25)";
         pedals.forEach((pedal) => {
             const pedalStart = Number(pedal.start) || 0;
             const pedalDuration = Math.max(0, Number(pedal.duration) || 0);
@@ -792,25 +1127,102 @@ document.addEventListener("DOMContentLoaded", () => {
 
             const x = (pedalStart / duration) * virtualWidth - scrollLeft;
             const w = Math.max(1, (pedalDuration / duration) * virtualWidth);
-            ctx.fillRect(x, height - pedalHeight, w, pedalHeight);
+            ctx.fillRect(x, laneTop + 4, w, pedalHeight - 8);
         });
-        ctx.strokeStyle = "rgba(0, 123, 255, 0.5)";
-        ctx.strokeRect(0, height - pedalHeight, backingWidth, pedalHeight);
 
-        // Draw notes
-        notes.forEach((note) => {
-            const noteStart = Number(note.start) || 0;
-            const noteDuration = Math.max(0, Number(note.duration) || 0);
-            const noteEnd = noteStart + noteDuration;
-            if (noteEnd < startTime || noteStart > endTime) return;
+        ctx.strokeStyle = "rgba(37, 99, 235, 0.65)";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(0, laneTop, backingWidth, pedalHeight);
 
-            const y = height - (note.pitch - minPitch) * keyHeight;
-            const x = (noteStart / duration) * virtualWidth - scrollLeft;
-            const w = Math.max(1, (noteDuration / duration) * virtualWidth);
+        // Compact onset markers: a small red arrow pointing up from the pedal lane.
+        pedals.forEach((pedal) => {
+            const pedalStart = Number(pedal.start) || 0;
+            if (pedalStart < startTime || pedalStart > endTime) return;
 
-            ctx.fillStyle = `rgba(0, 0, 0, ${clamp(Number(note.velocity) || 0.8, 0, 1) * 0.8 + 0.2})`;
-            ctx.fillRect(x, y - keyHeight, w, keyHeight);
+            const x = (pedalStart / duration) * virtualWidth - scrollLeft;
+            if (x < -4 || x > backingWidth + 4) return;
+
+            const arrowTipY = height - 13;
+            const arrowBaseY = height - 5;
+            ctx.fillStyle = "rgba(220, 38, 38, 0.65)";
+            ctx.beginPath();
+            ctx.moveTo(x, arrowTipY);
+            ctx.lineTo(x - 4, arrowBaseY);
+            ctx.lineTo(x + 4, arrowBaseY);
+            ctx.closePath();
+            ctx.fill();
         });
+
+        // Compact offset markers: a green arrow pointing down at pedal release.
+        pedals.forEach((pedal) => {
+            if (pedal.offset_estimated === true) return;
+
+            const pedalStart = Number(pedal.start) || 0;
+            const pedalDuration = Math.max(0, Number(pedal.duration) || 0);
+            const pedalEnd = Number.isFinite(Number(pedal.end))
+                ? Number(pedal.end)
+                : pedalStart + pedalDuration;
+            if (pedalEnd < startTime || pedalEnd > endTime) return;
+
+            const x = (pedalEnd / duration) * virtualWidth - scrollLeft;
+            if (x < -4 || x > backingWidth + 4) return;
+
+            const arrowTipY = laneTop + 13;
+            const arrowBaseY = laneTop + 5;
+            ctx.fillStyle = "rgba(22, 163, 74, 0.75)";
+            ctx.beginPath();
+            ctx.moveTo(x, arrowTipY);
+            ctx.lineTo(x - 4, arrowBaseY);
+            ctx.lineTo(x + 4, arrowBaseY);
+            ctx.closePath();
+            ctx.fill();
+        });
+    }
+
+    function drawPlaybackIndicator(duration, virtualWidth, scrollLeft, backingWidth, height) {
+        if (!pianoRollState || playbackDuration <= 0) return;
+
+        const currentTime = clamp(playbackPosition, 0, duration);
+        const x = (currentTime / duration) * virtualWidth - scrollLeft;
+        if (x < -8 || x > backingWidth + 8) return;
+
+        ctx.save();
+        ctx.strokeStyle = PLAYHEAD_COLOR;
+        ctx.fillStyle = PLAYHEAD_COLOR;
+        ctx.lineWidth = 2;
+        ctx.shadowColor = "rgba(249, 115, 22, 0.35)";
+        ctx.shadowBlur = playbackState === "playing" ? 8 : 0;
+
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, height);
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.moveTo(x, 11);
+        ctx.lineTo(x - 7, 1);
+        ctx.lineTo(x + 7, 1);
+        ctx.closePath();
+        ctx.fill();
+
+        ctx.shadowBlur = 0;
+        const label = formatPlaybackTime(currentTime);
+        ctx.font = "bold 11px sans-serif";
+        const labelWidth = ctx.measureText(label).width + 10;
+        const labelX = clamp(x + 6, 2, Math.max(2, backingWidth - labelWidth - 2));
+        ctx.fillStyle = "rgba(249, 115, 22, 0.95)";
+        ctx.fillRect(labelX, 20, labelWidth, 18);
+        ctx.fillStyle = "#fff";
+        ctx.fillText(label, labelX + 5, 33);
+        ctx.restore();
+    }
+
+    function formatPlaybackTime(seconds) {
+        const safeSeconds = Math.max(0, Number(seconds) || 0);
+        const minutes = Math.floor(safeSeconds / 60);
+        const wholeSeconds = Math.floor(safeSeconds % 60);
+        const tenths = Math.floor((safeSeconds % 1) * 10);
+        return `${minutes}:${String(wholeSeconds).padStart(2, "0")}.${tenths}`;
     }
 
     function drawTimeTicks(startTime, endTime, duration, virtualWidth, scrollLeft, backingWidth) {

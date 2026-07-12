@@ -239,14 +239,31 @@ def _shape_tuple(value):
     return tuple(value.shape) if hasattr(value, "shape") else None
 
 
-def format_load_model_warnings(report):
-    """Format non-strict checkpoint loading diagnostics as warning strings."""
+def format_load_model_warnings(
+    report,
+    ignored_missing_keys=None,
+    ignored_missing_key_prefixes=None,
+):
+    """Format non-strict checkpoint loading diagnostics as warning strings.
+
+    ``ignored_missing_keys`` and ``ignored_missing_key_prefixes`` are intended
+    for explicitly expected migration paths, such as loading an older note-only
+    checkpoint into a newer model that initializes a newly-added head from
+    scratch. They only affect the *missing key* diagnostic; unexpected and
+    shape-mismatched checkpoint entries are always reported.
+    """
     warnings = []
     if not report or report.get("strict", True):
         return warnings
 
     path = report.get("path", "<unknown checkpoint>")
-    missing_keys = report.get("missing_keys", [])
+    ignored_missing_keys = set(ignored_missing_keys or ())
+    ignored_missing_key_prefixes = tuple(ignored_missing_key_prefixes or ())
+    missing_keys = [
+        key for key in report.get("missing_keys", [])
+        if key not in ignored_missing_keys
+        and not any(key.startswith(prefix) for prefix in ignored_missing_key_prefixes)
+    ]
     unexpected_keys = report.get("unexpected_keys", [])
     shape_mismatched_keys = report.get("shape_mismatched_keys", [])
 
@@ -298,6 +315,10 @@ def load_model(model, path, eval_phase=True, strict=True, to_cpu=False):
     }
 
     if not strict:
+        migration_fn = getattr(model, "migrate_checkpoint_state_dict", None)
+        if callable(migration_fn):
+            state_dict = migration_fn(state_dict)
+
         model_state = model.state_dict()
         filtered_state_dict = OrderedDict()
         if hasattr(state_dict, "_metadata"):

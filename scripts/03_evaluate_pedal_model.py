@@ -20,6 +20,7 @@ capabilities alongside standard onset and velocity metrics.
 """
 
 import gc
+import json
 import os
 
 # For omegaconf
@@ -40,7 +41,12 @@ from ov_piano.data.maestro import (
     MetaMAESTROv3,
 )
 from ov_piano.eval import (
+    EvaluationCheckpointStore,
     GtLoaderMaestro,
+    evaluation_checkpoint_path,
+    evaluation_fingerprint,
+    metadata_to_file_id,
+    pedal_grid_search,
     threshold_eval_pedals,
     threshold_eval_single_file,
 )
@@ -60,7 +66,11 @@ EVALUATION_PRESETS: Dict[str, Dict[str, object]] = {
         "XV_TAKE_ONE_EVERY": 50,
         "SEARCH_THRESHOLDS": (0.85,),
         "SEARCH_SHIFTS": (-0.01,),
-        "PEDAL_SEARCH_THRESHOLDS": (0.5,),
+        "PEDAL_SEARCH_THRESHOLDS": (0.1, 0.3, 0.5, 0.7, 0.9),
+        "PEDAL_SEARCH_HYSTERESIS": (0.02, 0.05, 0.1, 0.15),
+        "PEDAL_SEARCH_MIN_HOLD_STEPS": (1, 2, 4, 8),
+        "PEDAL_SEARCH_SMOOTHING_WINDOWS": (1, 3, 5, 7, 11),
+        "PEDAL_SEARCH_SHIFTS": (-0.05, 0.0, 0.05),
         "MAX_PREDICTIONS_PER_FILE": 20000,
         "INFERENCE_CHUNK_SIZE": 30,
     },
@@ -68,7 +78,11 @@ EVALUATION_PRESETS: Dict[str, Dict[str, object]] = {
         "XV_TAKE_ONE_EVERY": 20,
         "SEARCH_THRESHOLDS": (0.85,),
         "SEARCH_SHIFTS": (-0.01,),
-        "PEDAL_SEARCH_THRESHOLDS": (0.3, 0.5, 0.7),
+        "PEDAL_SEARCH_THRESHOLDS": (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9),
+        "PEDAL_SEARCH_HYSTERESIS": (0.02, 0.05, 0.1, 0.15),
+        "PEDAL_SEARCH_MIN_HOLD_STEPS": (1, 2, 4, 8),
+        "PEDAL_SEARCH_SMOOTHING_WINDOWS": (1, 3, 5, 7, 11),
+        "PEDAL_SEARCH_SHIFTS": (-0.05, -0.025, 0.0, 0.025, 0.05),
         "MAX_PREDICTIONS_PER_FILE": 20000,
         "INFERENCE_CHUNK_SIZE": 60,
     },
@@ -76,7 +90,11 @@ EVALUATION_PRESETS: Dict[str, Dict[str, object]] = {
         "XV_TAKE_ONE_EVERY": 1,
         "SEARCH_THRESHOLDS": (0.70, 0.75, 0.80, 0.85),
         "SEARCH_SHIFTS": (-0.03, -0.02, -0.01, 0.0, 0.01),
-        "PEDAL_SEARCH_THRESHOLDS": (0.3, 0.5, 0.7),
+        "PEDAL_SEARCH_THRESHOLDS": (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9),
+        "PEDAL_SEARCH_HYSTERESIS": (0.02, 0.05, 0.1, 0.15),
+        "PEDAL_SEARCH_MIN_HOLD_STEPS": (1, 2, 4, 8),
+        "PEDAL_SEARCH_SMOOTHING_WINDOWS": (1, 3, 5, 7, 11),
+        "PEDAL_SEARCH_SHIFTS": (-0.05, -0.025, 0.0, 0.025, 0.05),
         "MAX_PREDICTIONS_PER_FILE": 50000,
         "INFERENCE_CHUNK_SIZE": 300,
     },
@@ -146,6 +164,9 @@ class ConfDef:
     MAESTRO_PATH: str = os.path.join("datasets", "maestro", "maestro-v3.0.0")
     MAESTRO_VERSION: int = 3
     OUTPUT_DIR: str = "out"
+    EVALUATION_CHECKPOINTS_ENABLED: bool = True
+    EVALUATION_CHECKPOINT_DIR: Optional[str] = None
+    RESET_EVALUATION_CHECKPOINTS: bool = False
     #
     HDF5_MEL_PATH: str = os.path.join(
         "datasets", "MAESTROv3_logmel_sr=16000_stft=2048w384h_mel=229(50-8000).h5"
@@ -155,7 +176,7 @@ class ConfDef:
     )
     SNAPSHOT_INPATH: str = os.path.join(
         "assets",
-        "OnsetsAndVelocities_2023_03_04_09_53_53.289step=43500_f1=0.9675__0.9480.torch",
+        "OnsetsAndVelocities_2026_07_12_08_12_56.769.torch",
     )
     #
     CONV1X1: List[int] = (200, 200)  # MUST match checkpoint architecture!
@@ -166,7 +187,11 @@ class ConfDef:
         0.85,
     )  # High threshold to prevent too many predictions
     SEARCH_SHIFTS: List[float] = (-0.01,)
-    PEDAL_SEARCH_THRESHOLDS: List[float] = (0.3, 0.5, 0.7)
+    PEDAL_SEARCH_THRESHOLDS: List[float] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+    PEDAL_SEARCH_HYSTERESIS: List[float] = (0.02, 0.05, 0.1, 0.15)
+    PEDAL_SEARCH_MIN_HOLD_STEPS: List[int] = (1, 2, 4, 8)
+    PEDAL_SEARCH_SMOOTHING_WINDOWS: List[int] = (1, 3, 5, 7, 11)
+    PEDAL_SEARCH_SHIFTS: List[float] = (-0.05, -0.025, 0.0, 0.025, 0.05)
     MAX_PREDICTIONS_PER_FILE: int = (
         20000  # Safety limit (normal files have 1k-5k notes)
     )
@@ -237,6 +262,47 @@ if __name__ == "__main__":
             "FULL VALIDATION SEARCH: all validation files are used. This is the "
             "recommended mode for reportable/final metrics."
         )
+
+    EVAL_CHECKPOINT_DIR = CONF.EVALUATION_CHECKPOINT_DIR
+    if EVAL_CHECKPOINT_DIR is None:
+        EVAL_CHECKPOINT_DIR = os.path.join(CONF.OUTPUT_DIR, "eval_checkpoints")
+    if CONF.EVALUATION_CHECKPOINTS_ENABLED:
+        os.makedirs(EVAL_CHECKPOINT_DIR, exist_ok=True)
+        txt_logger.info(f"Evaluation checkpoints enabled: {EVAL_CHECKPOINT_DIR}")
+    else:
+        txt_logger.warning("Evaluation checkpoints disabled")
+
+    def _snapshot_signature(path):
+        abspath = os.path.abspath(os.fspath(path))
+        signature = {"path": abspath}
+        try:
+            stat = os.stat(abspath)
+            signature.update({"size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)})
+        except OSError:
+            signature["missing"] = True
+        return signature
+
+    SNAPSHOT_SIGNATURE = _snapshot_signature(CONF.SNAPSHOT_INPATH)
+
+    def _make_checkpoint_store(stage, config):
+        fingerprint = evaluation_fingerprint(config)
+        path = evaluation_checkpoint_path(
+            EVAL_CHECKPOINT_DIR,
+            os.path.basename(__file__),
+            stage,
+            fingerprint,
+        )
+        store = EvaluationCheckpointStore(
+            path,
+            fingerprint,
+            stage,
+            enabled=CONF.EVALUATION_CHECKPOINTS_ENABLED,
+            reset=CONF.RESET_EVALUATION_CHECKPOINTS,
+            logger=txt_logger.info,
+        )
+        if CONF.EVALUATION_CHECKPOINTS_ENABLED:
+            txt_logger.info(f"Evaluation checkpoint [{stage}]: {path}")
+        return store
 
     txt_logger.info("Loading datasets")
     metamaestro_xv = METAMAESTRO_CLASS(
@@ -316,16 +382,67 @@ if __name__ == "__main__":
         """
         return model_outputs_to_probabilities(model(x), include_pedals=True)
 
+    xv_file_ids = [metadata_to_file_id(md) for _, _, md in maestro_xv.data]
+    xv_inference_store = _make_checkpoint_store(
+        "xv_inference",
+        {
+            "snapshot": SNAPSHOT_SIGNATURE,
+            "maestro_version": int(CONF.MAESTRO_VERSION),
+            "maestro_path": os.path.abspath(CONF.MAESTRO_PATH),
+            "hdf5_mel_path": os.path.abspath(CONF.HDF5_MEL_PATH),
+            "hdf5_roll_path": os.path.abspath(CONF.HDF5_ROLL_PATH),
+            "split": "validation",
+            "file_ids": xv_file_ids,
+            "evaluation_preset": str(CONF.EVALUATION_PRESET),
+            "xv_take_one_every": int(CONF.XV_TAKE_ONE_EVERY),
+            "secs_per_frame": float(SECS_PER_FRAME),
+            "chunk_size": int(CHUNK_SIZE),
+            "chunk_overlap": int(CHUNK_OVERLAP),
+            "conv1x1": list(CONF.CONV1X1),
+            "leaky_relu_slope": CONF.LEAKY_RELU_SLOPE,
+            "decoder_gauss_std": float(CONF.DECODER_GAUSS_STD),
+            "decoder_gauss_ksize": int(CONF.DECODER_GAUSS_KSIZE),
+            "decoder_pthresh": float(min(CONF.SEARCH_THRESHOLDS)),
+            "max_predictions_per_file": int(CONF.MAX_PREDICTIONS_PER_FILE),
+        },
+    )
+
     len_xv = len(maestro_xv)
     xv_dataframes = []
     for i, (mel, roll, md) in enumerate(maestro_xv, 1):
+        file_id = metadata_to_file_id(md)
         txt_logger.info(f"[{i}/{len_xv}] XV inference: {md}")
         try:
+            cached_entry = xv_inference_store.get(file_id)
+            if isinstance(cached_entry, dict):
+                if cached_entry.get("status") == "ok":
+                    txt_logger.info(f"  XV checkpoint hit: {file_id}")
+                    xv_dataframes.append(
+                        (
+                            file_id,
+                            cached_entry["gt_df"],
+                            cached_entry["pred_df"],
+                            cached_entry["gt_pedal_df"],
+                            cached_entry["pedal_pred"],
+                        )
+                    )
+                    continue
+                if cached_entry.get("status") == "skipped":
+                    txt_logger.warning(
+                        f"  XV checkpoint skip: {file_id} "
+                        f"({cached_entry.get('reason', 'unknown')})"
+                    )
+                    continue
+
             with torch.no_grad():
                 tmel = torch.from_numpy(mel).to(CONF.DEVICE).unsqueeze(0)
                 # Skip empty inputs
                 if tmel.shape[-1] == 0:
                     txt_logger.warning(f"SKIPPING {md[0]}: Empty mel input (0 frames)")
+                    xv_inference_store.upsert(
+                        file_id,
+                        {"status": "skipped", "metadata": tuple(md), "reason": "empty_mel"},
+                    )
                     del tmel
                     continue
 
@@ -337,6 +454,14 @@ if __name__ == "__main__":
                 if not _res or len(_res) < 3:
                     msg = f"SKIPPING {md[0]}: strided_inference returned invalid result: {type(_res)} len={len(_res) if hasattr(_res, '__len__') else 'NA'}"
                     txt_logger.error(msg)
+                    xv_inference_store.upsert(
+                        file_id,
+                        {
+                            "status": "skipped",
+                            "metadata": tuple(md),
+                            "reason": "invalid_inference_result",
+                        },
+                    )
                     continue
 
                 onset_pred, vel_pred, pedal_pred = _res
@@ -346,6 +471,7 @@ if __name__ == "__main__":
                 # Process pedal predictions
                 if pedal_pred.dim() == 2:
                     pedal_pred = pedal_pred.unsqueeze(0)  # Add batch dimension
+                pedal_pred = pedal_pred.cpu()
 
                 # Safety check: skip files with excessive predictions
                 num_preds = len(pred_df)
@@ -358,10 +484,31 @@ if __name__ == "__main__":
                         f"SKIPPING {md[0]}: Too many predictions ({num_preds:,}) "
                         f"vs {num_gt:,} ground truth. This would cause OOM."
                     )
+                    xv_inference_store.upsert(
+                        file_id,
+                        {
+                            "status": "skipped",
+                            "metadata": tuple(md),
+                            "reason": "too_many_predictions",
+                            "num_predictions": int(num_preds),
+                            "num_ground_truth": int(num_gt),
+                        },
+                    )
                     continue
 
                 txt_logger.info(f"  GT: {num_gt:,} notes, Pred: {num_preds:,} notes")
-                xv_dataframes.append((gt_df, pred_df, gt_pedal_df, pedal_pred))
+                xv_inference_store.upsert(
+                    file_id,
+                    {
+                        "status": "ok",
+                        "metadata": tuple(md),
+                        "gt_df": gt_df,
+                        "pred_df": pred_df,
+                        "gt_pedal_df": gt_pedal_df,
+                        "pedal_pred": pedal_pred,
+                    },
+                )
+                xv_dataframes.append((file_id, gt_df, pred_df, gt_pedal_df, pedal_pred))
 
         except Exception as e:
             txt_logger.error(f"ERROR processing {md[0]}: {e}")
@@ -376,6 +523,10 @@ if __name__ == "__main__":
                 "pedal_pred",
                 "tmel",
                 "_res",
+                "pred_df",
+                "gt_df",
+                "gt_pedal_df",
+                "cached_entry",
             ):
                 if v in locals():
                     try:
@@ -406,14 +557,36 @@ if __name__ == "__main__":
         f"Successfully processed {len(xv_dataframes)} / {len_xv} validation files"
     )
 
+    xv_note_grid_store = _make_checkpoint_store(
+        "xv_note_grid",
+        {
+            "source_stage": "xv_inference",
+            "source_fingerprint": xv_inference_store.fingerprint,
+            "file_ids": [item[0] for item in xv_dataframes],
+            "thresholds": list(CONF.SEARCH_THRESHOLDS),
+            "shifts": list(CONF.SEARCH_SHIFTS),
+            "secs_per_frame": float(SECS_PER_FRAME),
+            "key_beg": int(key_beg),
+            "tolerance_secs": float(CONF.TOLERANCE_SECS),
+            "tolerance_vel": float(CONF.TOLERANCE_VEL),
+        },
+    )
     xv_gridsearch = {}
     xv_gridsearch_vel = {}
     for thresh in CONF.SEARCH_THRESHOLDS:
         for shift in CONF.SEARCH_SHIFTS:
+            checkpoint_key = json.dumps((float(thresh), float(shift)))
+            cached_note_grid = xv_note_grid_store.get(checkpoint_key)
+            if isinstance(cached_note_grid, dict) and cached_note_grid.get("status") == "ok":
+                txt_logger.info(f"XV notes checkpoint hit: {(thresh, shift)}")
+                xv_gridsearch[(thresh, shift)] = [tuple(x) for x in cached_note_grid["eval"]]
+                xv_gridsearch_vel[(thresh, shift)] = [tuple(x) for x in cached_note_grid["eval_vel"]]
+                continue
+
             this_eval = []
             this_eval_vel = []
 
-            for i, (gtdf, preddf, _, _) in enumerate(xv_dataframes, 1):
+            for i, (_, gtdf, preddf, _, _) in enumerate(xv_dataframes, 1):
                 txt_logger.info(
                     f"[{i}/{len(xv_dataframes)} XV notes]: {(thresh, shift)}"
                 )
@@ -432,30 +605,46 @@ if __name__ == "__main__":
 
             xv_gridsearch[(thresh, shift)] = this_eval
             xv_gridsearch_vel[(thresh, shift)] = this_eval_vel
+            xv_note_grid_store.upsert(
+                checkpoint_key,
+                {
+                    "status": "ok",
+                    "threshold": float(thresh),
+                    "shift": float(shift),
+                    "eval": [tuple(map(float, x)) for x in this_eval],
+                    "eval_vel": [tuple(map(float, x)) for x in this_eval_vel],
+                },
+            )
 
-    xv_gridsearch_pedal = {}
-    for pedal_thresh in CONF.PEDAL_SEARCH_THRESHOLDS:
-        this_eval_pedal = []
-        for i, (_, _, gt_pedal_df, pedal_pred) in enumerate(xv_dataframes, 1):
-            txt_logger.info(f"[{i}/{len(xv_dataframes)} XV pedal]: {pedal_thresh}")
-            try:
-                pedal_results = threshold_eval_pedals(
-                    gt_pedal_df,
-                    pedal_pred,
-                    SECS_PER_FRAME,
-                    thresh=pedal_thresh,
-                    tol_secs=CONF.TOLERANCE_SECS,
-                )
-                if "sustain" in pedal_results:
-                    s = pedal_results["sustain"]
-                    pedal_prf1 = (s["precision"], s["recall"], s["f1"])
-                else:
-                    pedal_prf1 = (0.0, 0.0, 0.0)
-            except Exception as e:
-                txt_logger.warning(f"Pedal eval failed: {e}")
-                pedal_prf1 = (0.0, 0.0, 0.0)
-            this_eval_pedal.append(pedal_prf1)
-        xv_gridsearch_pedal[pedal_thresh] = this_eval_pedal
+    xv_pedal_grid_store = _make_checkpoint_store(
+        "xv_pedal_grid",
+        {
+            "source_stage": "xv_inference",
+            "source_fingerprint": xv_inference_store.fingerprint,
+            "file_ids": [item[0] for item in xv_dataframes],
+            "secs_per_frame": float(SECS_PER_FRAME),
+            "thresholds": list(CONF.PEDAL_SEARCH_THRESHOLDS),
+            "hysteresis_values": list(CONF.PEDAL_SEARCH_HYSTERESIS),
+            "smoothing_windows": list(CONF.PEDAL_SEARCH_SMOOTHING_WINDOWS),
+            "min_hold_steps_values": list(CONF.PEDAL_SEARCH_MIN_HOLD_STEPS),
+            "shifts": list(CONF.PEDAL_SEARCH_SHIFTS),
+            "tolerance_secs": float(CONF.TOLERANCE_SECS),
+        },
+    )
+    xv_summary_pedal, best_pedal_params, best_pedal_metrics = pedal_grid_search(
+        ((gt_pedal_df, pedal_pred) for _, _, _, gt_pedal_df, pedal_pred in xv_dataframes),
+        SECS_PER_FRAME,
+        thresholds=CONF.PEDAL_SEARCH_THRESHOLDS,
+        hysteresis_values=CONF.PEDAL_SEARCH_HYSTERESIS,
+        smoothing_windows=CONF.PEDAL_SEARCH_SMOOTHING_WINDOWS,
+        min_hold_steps_values=CONF.PEDAL_SEARCH_MIN_HOLD_STEPS,
+        shifts=CONF.PEDAL_SEARCH_SHIFTS,
+        tol_secs=CONF.TOLERANCE_SECS,
+        logger=txt_logger.info,
+        log_prefix="XV pedal",
+        max_logged_items=1,
+        checkpoint_store=xv_pedal_grid_store,
+    )
 
     # Compute mean metrics ensuring proper array shape
     xv_summary = {}
@@ -473,13 +662,6 @@ if __name__ == "__main__":
             mean_val = np.array([mean_val, mean_val, mean_val])
         xv_summary_vel[k] = mean_val
 
-    xv_summary_pedal = {}
-    for k, v in xv_gridsearch_pedal.items():
-        v = np.asarray(v)
-        if v.ndim != 2 or v.shape[1] != 3:
-            xv_summary_pedal[k] = np.array([0.0, 0.0, 0.0])
-        else:
-            xv_summary_pedal[k] = v.mean(axis=0)
     # Find best threshold/shift based on F1 score
     try:
         ((best_t, best_s), (best_p, best_r, best_f1)) = max(
@@ -502,13 +684,32 @@ if __name__ == "__main__":
         columns=["threshold", "shift", "P", "R", "F1"],
     )
 
-    (best_pedal_t, (best_pedal_p, best_pedal_r, best_pedal_f1)) = max(
-        xv_summary_pedal.items(), key=lambda elt: elt[1][2]
-    )
+    if best_pedal_params is None:
+        raise RuntimeError("No pedal hyperparameter combinations were evaluated")
+    (
+        best_pedal_t,
+        best_pedal_h,
+        best_pedal_smoothing,
+        best_pedal_min_hold,
+        best_pedal_shift,
+    ) = best_pedal_params
+    best_pedal_p, best_pedal_r, best_pedal_f1 = best_pedal_metrics
 
     xv_summary_df_pedal = pd.DataFrame(
-        ((t, p, r, f1) for (t, (p, r, f1)) in xv_summary_pedal.items()),
-        columns=["threshold", "P", "R", "F1"],
+        (
+            (t, h, sw, mh, s, p, r, f1)
+            for ((t, h, sw, mh, s), (p, r, f1)) in xv_summary_pedal.items()
+        ),
+        columns=[
+            "threshold",
+            "hysteresis",
+            "smoothing_window",
+            "min_hold_steps",
+            "shift",
+            "P",
+            "R",
+            "F1",
+        ],
     )
 
     txt_logger.warning("XV HYPERPARAMETER SEARCH:")
@@ -523,11 +724,70 @@ if __name__ == "__main__":
     test_results_vel = []
     test_results_pedal = []
     len_test = len(maestro_test)
+    test_file_ids = [metadata_to_file_id(md) for _, _, md in maestro_test.data]
+    test_metrics_store = _make_checkpoint_store(
+        "test_metrics",
+        {
+            "snapshot": SNAPSHOT_SIGNATURE,
+            "maestro_version": int(CONF.MAESTRO_VERSION),
+            "maestro_path": os.path.abspath(CONF.MAESTRO_PATH),
+            "hdf5_mel_path": os.path.abspath(CONF.HDF5_MEL_PATH),
+            "hdf5_roll_path": os.path.abspath(CONF.HDF5_ROLL_PATH),
+            "split": "test",
+            "file_ids": test_file_ids,
+            "secs_per_frame": float(SECS_PER_FRAME),
+            "chunk_size": int(CHUNK_SIZE),
+            "chunk_overlap": int(CHUNK_OVERLAP),
+            "conv1x1": list(CONF.CONV1X1),
+            "leaky_relu_slope": CONF.LEAKY_RELU_SLOPE,
+            "decoder_gauss_std": float(CONF.DECODER_GAUSS_STD),
+            "decoder_gauss_ksize": int(CONF.DECODER_GAUSS_KSIZE),
+            "decoder_pthresh": float(min(CONF.SEARCH_THRESHOLDS)),
+            "max_predictions_per_file": int(CONF.MAX_PREDICTIONS_PER_FILE),
+            "best_note_threshold": float(best_t),
+            "best_note_shift": float(best_s),
+            "best_pedal_threshold": float(best_pedal_t),
+            "best_pedal_hysteresis": float(best_pedal_h),
+            "best_pedal_smoothing_window": int(best_pedal_smoothing),
+            "best_pedal_min_hold_steps": int(best_pedal_min_hold),
+            "best_pedal_shift": float(best_pedal_shift),
+            "tolerance_secs": float(CONF.TOLERANCE_SECS),
+            "tolerance_vel": float(CONF.TOLERANCE_VEL),
+        },
+    )
     for i, (mel, roll, md) in enumerate(maestro_test, 1):
+        file_id = metadata_to_file_id(md)
         txt_logger.info(f"[{i}/{len_test} (test set)] {md}")
         try:
+            cached_entry = test_metrics_store.get(file_id)
+            if isinstance(cached_entry, dict):
+                if cached_entry.get("status") == "ok":
+                    txt_logger.info(f"  Test checkpoint hit: {file_id}")
+                    filename = cached_entry.get("filename", file_id)
+                    prf1 = tuple(cached_entry["prf1"])
+                    prf1_v = tuple(cached_entry["prf1_v"])
+                    pedal_prf1 = tuple(cached_entry["pedal_prf1"])
+                    test_results.append((filename, *prf1))
+                    test_results_vel.append((filename, *prf1_v))
+                    test_results_pedal.append((filename, *pedal_prf1))
+                    continue
+                if cached_entry.get("status") == "skipped":
+                    txt_logger.warning(
+                        f"  Test checkpoint skip: {file_id} "
+                        f"({cached_entry.get('reason', 'unknown')})"
+                    )
+                    continue
+
             with torch.no_grad():
                 tmel = torch.from_numpy(mel).to(CONF.DEVICE).unsqueeze(0)
+                if tmel.shape[-1] == 0:
+                    txt_logger.warning(f"SKIPPING {md[0]}: Empty mel input (0 frames)")
+                    test_metrics_store.upsert(
+                        file_id,
+                        {"status": "skipped", "filename": md[0], "metadata": tuple(md), "reason": "empty_mel"},
+                    )
+                    del tmel
+                    continue
                 onset_pred, vel_pred, pedal_pred = strided_inference(
                     model_inference, tmel, CHUNK_SIZE, CHUNK_OVERLAP
                 )
@@ -540,6 +800,7 @@ if __name__ == "__main__":
                 # Process pedal predictions
                 if pedal_pred.dim() == 2:
                     pedal_pred = pedal_pred.unsqueeze(0)  # Add batch dimension
+                pedal_pred = pedal_pred.cpu()
 
             # Safety check: skip files with excessive predictions
             num_preds = len(pred_df)
@@ -549,6 +810,17 @@ if __name__ == "__main__":
                 txt_logger.warning(
                     f"SKIPPING {md[0]}: Too many predictions ({num_preds:,}) "
                     f"vs {num_gt:,} ground truth. This would cause OOM."
+                )
+                test_metrics_store.upsert(
+                    file_id,
+                    {
+                        "status": "skipped",
+                        "filename": md[0],
+                        "metadata": tuple(md),
+                        "reason": "too_many_predictions",
+                        "num_predictions": int(num_preds),
+                        "num_ground_truth": int(num_gt),
+                    },
                 )
                 continue
 
@@ -571,7 +843,11 @@ if __name__ == "__main__":
                     pedal_pred,
                     SECS_PER_FRAME,
                     thresh=best_pedal_t,
+                    shift_preds=best_pedal_shift,
                     tol_secs=CONF.TOLERANCE_SECS,
+                    hysteresis=best_pedal_h,
+                    smoothing_window=best_pedal_smoothing,
+                    min_hold_steps=best_pedal_min_hold,
                 )
                 # Extract sustain pedal metrics (index 0)
                 if "sustain" in pedal_results:
@@ -590,13 +866,42 @@ if __name__ == "__main__":
             test_results.append((md[0], *prf1))
             test_results_vel.append((md[0], *prf1_v))
             test_results_pedal.append((md[0], *pedal_prf1))
+            test_metrics_store.upsert(
+                file_id,
+                {
+                    "status": "ok",
+                    "filename": md[0],
+                    "metadata": tuple(md),
+                    "prf1": tuple(map(float, prf1)),
+                    "prf1_v": tuple(map(float, prf1_v)),
+                    "pedal_prf1": tuple(map(float, pedal_prf1)),
+                },
+            )
 
         except Exception as e:
             txt_logger.error(f"ERROR processing {md[0]}: {e}")
             continue
         finally:
-            # Aggressive memory cleanup
-            del mel, roll, onset_pred, vel_pred, pedal_pred, pred_df, gt_df, gt_pedal_df
+            # Aggressive memory cleanup (delete only names that were assigned).
+            # If inference fails before creating onset_pred/vel_pred/etc., a
+            # plain ``del`` raises NameError and masks the real processing error.
+            for v in (
+                "mel",
+                "roll",
+                "tmel",
+                "onset_pred",
+                "vel_pred",
+                "pedal_pred",
+                "pred_df",
+                "gt_df",
+                "gt_pedal_df",
+                "cached_entry",
+            ):
+                if v in locals():
+                    try:
+                        del locals()[v]
+                    except Exception:
+                        pass
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -621,7 +926,11 @@ if __name__ == "__main__":
         test_results_pedal, columns=["Filename", "P", "R", "F1"]
     )
     averages_pedal = [
-        f"AVERAGES (pedal_t={best_pedal_t})",
+        (
+            f"AVERAGES (pedal_t={best_pedal_t}, h={best_pedal_h}, "
+            f"smooth={best_pedal_smoothing}, hold={best_pedal_min_hold}, "
+            f"shift={best_pedal_shift})"
+        ),
         *test_results_df_pedal.iloc[:, 1:].mean().tolist(),
     ]
     test_results_df_pedal.loc[len(test_results_df_pedal)] = averages_pedal

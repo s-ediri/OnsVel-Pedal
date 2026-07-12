@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import wave
 
 import pytest
@@ -8,7 +9,10 @@ import torch
 from ov_piano.transcription import (
     AudioPreprocessingError,
     TranscriptionConfig,
+    _configure_pydub_binaries,
+    _decode_audio_segment_with_pydub,
     _pydub_decode_error_message,
+    _source_looks_like_opus,
     normalize_pedal_prediction_shape,
     load_wav_waveform,
     PianoTranscriber,
@@ -74,8 +78,11 @@ def test_transcription_config_rejects_invalid_decoder_values():
         TranscriptionConfig(device="cpu", pedal_threshold=-0.1).validate()
 
 
-def test_load_wav_waveform_reads_stereo_pcm():
-    interleaved_samples = torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.int16)
+def test_load_wav_waveform_reads_stereo_pcm_as_normalized_float_audio():
+    interleaved_samples = torch.tensor(
+        [0, 32767, -32768, 16384, 1, -1],
+        dtype=torch.int16,
+    )
 
     waveform, sample_rate = load_wav_waveform(
         _wav_bytes(interleaved_samples, sample_rate=8_000, num_channels=2)
@@ -83,8 +90,13 @@ def test_load_wav_waveform_reads_stereo_pcm():
 
     assert sample_rate == 8_000
     assert waveform.shape == (2, 3)
-    assert torch.equal(waveform[0], torch.tensor([1.0, 3.0, 5.0]))
-    assert torch.equal(waveform[1], torch.tensor([2.0, 4.0, 6.0]))
+    assert waveform.dtype == torch.float32
+    assert torch.allclose(waveform[0], torch.tensor([0.0, -1.0, 1.0 / 32768.0]))
+    assert torch.allclose(
+        waveform[1],
+        torch.tensor([32767.0 / 32768.0, 0.5, -1.0 / 32768.0]),
+    )
+    assert float(waveform.abs().max()) <= 1.0
 
 
 def test_pydub_decode_error_message_mentions_audioop_lts_for_python_313():
@@ -95,6 +107,130 @@ def test_pydub_decode_error_message_mentions_audioop_lts_for_python_313():
     assert "audioop-lts" in message
     assert "Python 3.13" in message
     assert "ffmpeg" in message
+
+
+def test_pydub_decode_error_message_explains_windows_dll_load_failure():
+    exc = RuntimeError("Decoding failed. ffmpeg returned error code: 3221225781")
+
+    message = _pydub_decode_error_message(exc)
+
+    assert "0xC0000135" in message
+    assert "required DLL is missing" in message
+    assert "ONSVEL_FFMPEG_PATH" in message
+
+
+def test_configure_pydub_binaries_uses_explicit_env_paths(monkeypatch, tmp_path):
+    ffmpeg = tmp_path / "ffmpeg.exe"
+    ffprobe = tmp_path / "ffprobe.exe"
+    ffmpeg.write_text("", encoding="utf-8")
+    ffprobe.write_text("", encoding="utf-8")
+
+    monkeypatch.setenv("ONSVEL_FFMPEG_PATH", str(ffmpeg))
+    monkeypatch.setenv("ONSVEL_FFPROBE_PATH", str(ffprobe))
+    monkeypatch.setattr("ov_piano.transcription._audio_tool_is_runnable", lambda path: True)
+
+    class FakeAudioSegment:
+        converter = "ffmpeg"
+
+    import pydub.utils as pydub_utils
+
+    original_get_prober_name = pydub_utils.get_prober_name
+    try:
+        resolved_ffmpeg, resolved_ffprobe = _configure_pydub_binaries(FakeAudioSegment)
+
+        assert resolved_ffmpeg == str(ffmpeg)
+        assert resolved_ffprobe == str(ffprobe)
+        assert FakeAudioSegment.converter == str(ffmpeg)
+        assert FakeAudioSegment.ffmpeg == str(ffmpeg)
+        assert FakeAudioSegment.ffprobe == str(ffprobe)
+        assert pydub_utils.get_prober_name() == str(ffprobe)
+    finally:
+        monkeypatch.setattr(pydub_utils, "get_prober_name", original_get_prober_name)
+
+
+def test_configure_pydub_binaries_skips_broken_path_candidate(monkeypatch, tmp_path):
+    broken_dir = tmp_path / "broken"
+    working_dir = tmp_path / "working"
+    broken_dir.mkdir()
+    working_dir.mkdir()
+    broken = broken_dir / "ffmpeg.exe"
+    working = working_dir / "ffmpeg.exe"
+    broken.write_text("", encoding="utf-8")
+    working.write_text("", encoding="utf-8")
+
+    monkeypatch.delenv("ONSVEL_FFMPEG_PATH", raising=False)
+    monkeypatch.delenv("FFMPEG_PATH", raising=False)
+    monkeypatch.delenv("FFMPEG_BINARY", raising=False)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(broken_dir), str(working_dir)]))
+    monkeypatch.setattr(
+        "ov_piano.transcription._audio_tool_is_runnable",
+        lambda path: os.path.abspath(path) == os.path.abspath(working),
+    )
+
+    class FakeAudioSegment:
+        converter = "ffmpeg"
+
+    resolved_ffmpeg, _ = _configure_pydub_binaries(FakeAudioSegment)
+
+    assert resolved_ffmpeg == str(working)
+    assert FakeAudioSegment.converter == str(working)
+
+
+def test_source_looks_like_opus_uses_extension_mime_and_signature():
+    by_extension = io.BytesIO(b"not inspected")
+    by_extension.name = "recording.opus"
+    assert _source_looks_like_opus(by_extension)
+
+    class UploadedAudio:
+        filename = "recording.bin"
+        content_type = "audio/ogg; codecs=opus"
+
+        def __init__(self):
+            self.stream = io.BytesIO(b"not inspected")
+
+    assert _source_looks_like_opus(UploadedAudio())
+
+    by_signature = io.BytesIO(b"OggS" + (b"\x00" * 100) + b"OpusHead" + b"payload")
+    by_signature.seek(7)
+
+    assert _source_looks_like_opus(by_signature)
+    assert by_signature.tell() == 7
+    assert not _source_looks_like_opus(io.BytesIO(b"OggS" + b"Vorbis"))
+
+
+def test_pydub_opus_decode_fast_path_skips_generic_probe():
+    calls = []
+
+    class FakeAudioSegment:
+        @staticmethod
+        def from_file(source, **kwargs):
+            calls.append((source.tell(), kwargs))
+            return "decoded"
+
+    source = io.BytesIO(b"not a real opus file")
+    source.name = "clip.opus"
+    source.seek(5)
+
+    assert _decode_audio_segment_with_pydub(FakeAudioSegment, source) == "decoded"
+    assert calls == [(0, {"codec": "opus"})]
+
+
+def test_pydub_opus_decode_falls_back_to_generic_decode():
+    calls = []
+
+    class FakeAudioSegment:
+        @staticmethod
+        def from_file(source, **kwargs):
+            calls.append(kwargs)
+            if kwargs.get("codec") == "opus":
+                raise RuntimeError("forced opus decode failure")
+            return "decoded generically"
+
+    source = io.BytesIO(b"not a real opus file")
+    source.name = "clip.opus"
+
+    assert _decode_audio_segment_with_pydub(FakeAudioSegment, source) == "decoded generically"
+    assert calls == [{"codec": "opus"}, {}]
 
 
 def test_preprocess_waveform_uses_injected_logmel_and_checks_duration():
@@ -227,10 +363,11 @@ def test_run_inference_and_decode_uses_shared_pipeline_with_fake_model():
             frames = x.shape[-1] - 1
             onsets = torch.full((1, 88, frames), -20.0)
             velocities = torch.zeros(1, 88, frames)
-            pedals = torch.full((1, 1, frames), -20.0)
+            pedals = torch.full((1, 3, frames), -20.0)
             onsets[0, 0, 2] = 20.0
             velocities[0, 0, 2] = 20.0
-            pedals[0, 0, 1:4] = 20.0
+            pedals[0, 1, 1] = 20.0
+            pedals[0, 2, 3] = 20.0
             return [onsets], velocities, pedals
 
     result = run_inference_and_decode(FakeModel(), logmel, config)
@@ -238,6 +375,7 @@ def test_run_inference_and_decode_uses_shared_pipeline_with_fake_model():
     assert list(result.notes["key"]) == [0]
     assert list(result.notes["t_idx"]) == [3]
     assert set(result.pedal_events["event_type"]) == {"onset", "offset"}
+    assert list(result.pedal_events["t_idx"]) == [2, 4]
     assert result.logmel.shape == logmel.shape
 
 
@@ -278,14 +416,15 @@ def test_end_to_end_smoke_generated_wav_fake_model_json_schema(tmp_path):
             frames = x.shape[-1] - 1
             onsets = torch.full((x.shape[0], 88, frames), -20.0, device=x.device)
             velocities = torch.zeros((x.shape[0], 88, frames), device=x.device)
-            pedals = torch.full((x.shape[0], 1, frames), -20.0, device=x.device)
+            pedals = torch.full((x.shape[0], 3, frames), -20.0, device=x.device)
 
             note_frame = min(3, frames - 1)
             pedal_on = min(1, frames - 1)
             pedal_off = min(max(pedal_on + 3, 2), frames)
             onsets[0, 39, note_frame] = 20.0
             velocities[0, 39, note_frame] = 20.0
-            pedals[0, 0, pedal_on:pedal_off] = 20.0
+            pedals[0, 1, pedal_on] = 20.0
+            pedals[0, 2, max(pedal_on, pedal_off - 1)] = 20.0
             return [onsets], velocities, pedals
 
     logmel = transcriber.preprocess_audio(wav_path)

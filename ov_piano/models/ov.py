@@ -14,6 +14,51 @@ from .building_blocks import ContextAwareModule, DepthwiseConv2d, conv1x1net
 from ..utils import init_weights
 
 
+class ResidualTemporalConvBlock(torch.nn.Module):
+    """Residual dilated temporal convolution block for pedal prediction.
+
+    The main onset/velocity backbone produces note-aligned features with shape
+    ``(batch, channels, keys, time)``.  After the pedal branch collapses the key
+    axis to one bin, this block applies two dilated convolutions along the time
+    axis only.  Stacking blocks with increasing dilation gives the pedal heads a
+    broad temporal receptive field while preserving the input/output shape.
+    """
+
+    def __init__(
+            self, channels, kernel_width=5, dilation=1, bn_momentum=0.1,
+            leaky_relu_slope=0.1, dropout_p=0.1):
+        """
+        :param int channels: Number of input/output feature channels.
+        :param int kernel_width: Odd temporal convolution kernel width.
+        :param int dilation: Temporal dilation factor for both convolutions.
+        """
+        super().__init__()
+        assert (kernel_width % 2) == 1, "Only odd temporal kernels supported!"
+        padding = (0, (kernel_width // 2) * dilation)
+        self.kernel_width = kernel_width
+        self.dilation = dilation
+        self.net = torch.nn.Sequential(
+            torch.nn.Conv2d(
+                channels, channels, (1, kernel_width),
+                padding=padding, dilation=(1, dilation), bias=False),
+            torch.nn.BatchNorm2d(channels, momentum=bn_momentum),
+            get_relu(leaky_relu_slope),
+            torch.nn.Dropout2d(dropout_p),
+            torch.nn.Conv2d(
+                channels, channels, (1, kernel_width),
+                padding=padding, dilation=(1, dilation), bias=False),
+            torch.nn.BatchNorm2d(channels, momentum=bn_momentum),
+        )
+        self.activation = get_relu(leaky_relu_slope)
+
+    def forward(self, x):
+        """
+        :param x: Tensor of shape ``(batch, channels, 1, time)``.
+        :returns: Tensor with the same shape as ``x``.
+        """
+        return self.activation(x + self.net(x))
+
+
 # ##############################################################################
 # # MAIN MODEL
 # ##############################################################################
@@ -45,6 +90,20 @@ class OnsetsAndVelocities(torch.nn.Module):
     VSTAGE_CAM_KSIZES = ((1, 11), (1, 11), (1, 11))
     VSTAGE_CAM_DILATIONS = ((1, 1), (1, 2), (1, 3))
     VSTAGE_CAM_PADDINGS = ((0, 5), (0, 10), (0, 15))
+    # Pedal output channels: sustain state, pedal-down event, pedal-up event.
+    # The explicit transition channels are supervised during pedal fine-tuning
+    # and decoded directly for better event timing than state threshold crossings.
+    PEDAL_STATE_IDX = 0
+    PEDAL_ONSET_IDX = 1
+    PEDAL_OFFSET_IDX = 2
+    PEDAL_NUM_OUTPUTS = 3
+    PEDAL_HEAD_NAMES = (
+        "pedal_state_head",
+        "pedal_onset_head",
+        "pedal_offset_head",
+    )
+    PEDAL_TEMPORAL_KERNEL = 5
+    PEDAL_TEMPORAL_DILATIONS = (1, 2, 4, 8, 16)
 
     @staticmethod
     def get_cam_stage(in_chans, out_bins, conv1x1head=(200, 200),
@@ -155,22 +214,37 @@ class OnsetsAndVelocities(torch.nn.Module):
                     self.VSTAGE_CAM_DILATIONS, self.VSTAGE_CAM_PADDINGS,
                     bn_momentum, leaky_relu_slope, dropout_drop_p),
             SubSpectralNorm(1, out_height, out_height, bn_momentum))
-        # Lightweight sustain-pedal head. Pedal state is global, so collapse the
-        # key axis once instead of running another per-key CAM stack. This keeps
-        # pedal learning separate and avoids adding unnecessary capacity that can
-        # compete with onset/velocity training.
-        pedal_hidden = min(64, max(16, conv1x1head[0] // 4))
-        self.pedal_stage = torch.nn.Sequential(
+        # Sustain-pedal feature extractor. Pedal state is global, so collapse
+        # the key axis once and then use a compact residual TCN over time.
+        # With kernel 5 and dilations 1/2/4/8/16, the pedal heads can look over
+        # a much wider phrase-level window than a per-frame 1x1 head while still
+        # preserving the model's ``(batch, channels, time)`` output contract.
+        # Separate heads below predict active state, pedal-down transition, and
+        # pedal-up transition. Direct transition supervision improves event
+        # timing under strict onset/offset tolerances, while the state channel
+        # remains useful for frame-level monitoring and checkpoint diagnostics.
+        pedal_hidden = min(96, max(32, conv1x1head[0] // 2))
+        pedal_layers = [
             torch.nn.Conv2d(vel_in_chans, pedal_hidden, (out_height, 1),
                             bias=False),
             torch.nn.BatchNorm2d(pedal_hidden, momentum=bn_momentum),
             get_relu(leaky_relu_slope),
-            torch.nn.Conv2d(pedal_hidden, pedal_hidden, (1, 5),
-                            padding=(0, 2), bias=False),
-            torch.nn.BatchNorm2d(pedal_hidden, momentum=bn_momentum),
-            get_relu(leaky_relu_slope),
-            torch.nn.Dropout2d(dropout_drop_p),
-            torch.nn.Conv2d(pedal_hidden, 1, (1, 1)))
+        ]
+        for dilation in self.PEDAL_TEMPORAL_DILATIONS:
+            pedal_layers.append(
+                ResidualTemporalConvBlock(
+                    pedal_hidden,
+                    kernel_width=self.PEDAL_TEMPORAL_KERNEL,
+                    dilation=dilation,
+                    bn_momentum=bn_momentum,
+                    leaky_relu_slope=leaky_relu_slope,
+                    dropout_p=dropout_drop_p,
+                )
+            )
+        self.pedal_stage = torch.nn.Sequential(*pedal_layers)
+        self.pedal_state_head = torch.nn.Conv2d(pedal_hidden, 1, (1, 1))
+        self.pedal_onset_head = torch.nn.Conv2d(pedal_hidden, 1, (1, 1))
+        self.pedal_offset_head = torch.nn.Conv2d(pedal_hidden, 1, (1, 1))
 
         # initialize parameters
         if init_fn is not None:
@@ -188,6 +262,80 @@ class OnsetsAndVelocities(torch.nn.Module):
             module.se.set_biases(bias_val)
         except AttributeError:
             pass  # ignore: not a CAM module
+
+    def pedal_modules(self):
+        """Return modules that belong to the sustain-pedal prediction branch."""
+        return (
+            self.pedal_stage,
+            self.pedal_state_head,
+            self.pedal_onset_head,
+            self.pedal_offset_head,
+        )
+
+    def pedal_parameters(self):
+        """Yield all parameters belonging to the sustain-pedal branch."""
+        for module in self.pedal_modules():
+            yield from module.parameters()
+
+    def migrate_checkpoint_state_dict(self, state_dict):
+        """Migrate legacy monolithic pedal output weights into separate heads.
+
+        Earlier pedal-aware checkpoints used one final ``pedal_stage`` 1x1
+        convolution with three output channels. The index of that final
+        convolution depends on the exact historical pedal extractor, so scan for
+        a compatible ``pedal_stage.<idx>.weight`` tensor instead of assuming the
+        current ``pedal_stage`` length. The current model keeps a shared
+        temporal pedal extractor but has explicit state/onset/offset head
+        modules. During non-strict loading, copying each legacy output channel
+        into the matching head preserves as much learned pedal behavior as
+        possible while still allowing note-only checkpoints to initialize the
+        new branch from scratch.
+        """
+        legacy_weight_key = None
+        legacy_bias_key = None
+        for key, value in state_dict.items():
+            key_parts = key.split(".")
+            if (
+                len(key_parts) == 3
+                and key_parts[0] == "pedal_stage"
+                and key_parts[1].isdigit()
+                and key_parts[2] == "weight"
+                and isinstance(value, torch.Tensor)
+                and value.dim() == 4
+                and value.shape[0] == self.PEDAL_NUM_OUTPUTS
+                and tuple(value.shape[2:]) == (1, 1)
+            ):
+                legacy_weight_key = key
+                legacy_bias_key = f"pedal_stage.{key_parts[1]}.bias"
+                break
+        if legacy_weight_key is None:
+            return state_dict
+
+        legacy_weight = state_dict[legacy_weight_key]
+        migrated = state_dict.copy()
+        if hasattr(state_dict, "_metadata"):
+            migrated._metadata = state_dict._metadata
+        legacy_bias = state_dict.get(legacy_bias_key)
+
+        for channel_idx, head_name in enumerate(self.PEDAL_HEAD_NAMES):
+            head_weight_key = f"{head_name}.weight"
+            if head_weight_key not in migrated:
+                migrated[head_weight_key] = legacy_weight[channel_idx:channel_idx + 1].clone()
+
+            head_bias_key = f"{head_name}.bias"
+            if (
+                legacy_bias is not None
+                and isinstance(legacy_bias, torch.Tensor)
+                and legacy_bias.shape[0] == self.PEDAL_NUM_OUTPUTS
+                and head_bias_key not in migrated
+            ):
+                migrated[head_bias_key] = legacy_bias[channel_idx:channel_idx + 1].clone()
+
+        # Remove the old final convolution so it is not reported as an
+        # unexpected key after successful migration.
+        migrated.pop(legacy_weight_key, None)
+        migrated.pop(legacy_bias_key, None)
+        return migrated
 
     def forward_onsets(self, x):
         """
@@ -218,20 +366,29 @@ class OnsetsAndVelocities(torch.nn.Module):
 
     def forward_pedals(self, features):
         """
-        Predict the global sustain-pedal state from note-aligned features.
+        Predict global sustain-pedal state and transitions from note-aligned features.
 
         :param features: Tensor of shape ``(b, stem_chans + 1, keys, t)``.
-        :returns: Tensor of shape ``(b, 1, t)``.
+        :returns: Tensor of shape ``(b, 3, t)`` with channels
+          ``[state, onset/down, offset/up]``.
         """
-        return self.pedal_stage(features).squeeze(2)
+        pedal_features = self.pedal_stage(features)
+        return torch.cat(
+            [
+                self.pedal_state_head(pedal_features),
+                self.pedal_onset_head(pedal_features),
+                self.pedal_offset_head(pedal_features),
+            ],
+            dim=1,
+        ).squeeze(2)
 
     def forward(self, x, trainable_onsets=True):
         """
         :param x: Logmel batch of shape ``(b, melbins, t)``
         :returns: ``(x_stages, velocities, pedals)``. See ``forward_onsets`` for
           a description of ``x_stages``. The ``velocities`` tensor has shape
-          ``(b, keys, t-1)``, and ``pedals`` tensor has shape ``(b, 1, t-1)``
-          for the global sustain pedal.
+          ``(b, keys, t-1)``, and ``pedals`` tensor has shape ``(b, 3, t-1)``
+          for sustain state/down/up predictions.
         """
         if trainable_onsets:
             x_stages, stem_out = self.forward_onsets(x)

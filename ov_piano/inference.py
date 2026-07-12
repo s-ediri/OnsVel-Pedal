@@ -36,18 +36,27 @@ def strided_inference(model, x, chunk_size=10000, chunk_overlap=0):
     # sanity checks
     assert chunk_overlap >= 0, "overlap must be non-negative!"
     assert (chunk_overlap % 2) == 0, "chunk_overlap must be even!"
-    half_overlap = chunk_overlap // 2
-    #
     in_b, in_h, in_w = x.shape
     stride = chunk_size - chunk_overlap
     assert stride > 0, "chunk_overlap must be smaller than chunk_size!"
+
     if in_w <= chunk_size:
-        stride = chunk_size  # in this case only 1 chunk needed
+        chunk_starts = [0]
+    else:
+        # Keep the final chunk full-sized by moving its start backwards when the
+        # file length is not an exact multiple of the stride.  The stitching code
+        # below uses the *actual* overlap between neighbouring chunks, so this
+        # avoids losing frames at the end of long files.
+        last_start = in_w - chunk_size
+        chunk_starts = list(range(0, last_start + 1, stride))
+        if chunk_starts[-1] != last_start:
+            chunk_starts.append(last_start)
+    chunk_ends = [min(beg + chunk_size, in_w) for beg in chunk_starts]
     # compute strided inference
     # results is in the form [(out1a, out1b, ...), (out2a, out2b...)]
     results = []
-    for beg in range(0, in_w, stride):
-        chunk = x[..., beg:beg+chunk_size]
+    for beg, end in zip(chunk_starts, chunk_ends):
+        chunk = x[..., beg:end]
         outputs = model(chunk)
         assert isinstance(outputs, (list, tuple)), \
             "model must return a list or tuple of output tensors!"
@@ -74,13 +83,31 @@ def strided_inference(model, x, chunk_size=10000, chunk_overlap=0):
     # gather concatenated results
     t_results = []
     for result in map(list, zip(*results)):
-        # If we have 1 chunk or no overlap, return chunks as-is.
-        if len(result) > 1 and half_overlap > 0:
-            result[0] = result[0][..., :-half_overlap]
-            result[-1] = result[-1][..., half_overlap:]
-            for i in range(1, len(result) - 1):
-                result[i] = result[i][..., half_overlap:-half_overlap]
-        result = torch.cat(result, dim=-1)
+        if len(result) == 1:
+            result = result[0]
+        else:
+            # Determine absolute time boundaries between neighbouring chunks.
+            # For regular chunks this is equivalent to trimming half the overlap
+            # from each side.  For the adjusted final chunk, the true overlap can
+            # be larger than ``chunk_overlap``; splitting that actual overlap is
+            # what preserves ``t_out == t_in``.
+            boundaries = []
+            for left_end, right_start in zip(chunk_ends[:-1], chunk_starts[1:]):
+                assert right_start <= left_end, \
+                    "chunk generation produced a gap between chunks!"
+                overlap = left_end - right_start
+                boundaries.append(right_start + (overlap // 2))
+
+            stitched = []
+            for idx, chunk_result in enumerate(result):
+                keep_beg = 0 if idx == 0 else boundaries[idx - 1]
+                keep_end = in_w if idx == (len(result) - 1) else boundaries[idx]
+                local_beg = keep_beg - chunk_starts[idx]
+                local_end = keep_end - chunk_starts[idx]
+                assert 0 <= local_beg <= local_end <= chunk_result.shape[-1], \
+                    f"Invalid chunk trim: {(local_beg, local_end, chunk_result.shape)}"
+                stitched.append(chunk_result[..., local_beg:local_end])
+            result = torch.cat(stitched, dim=-1)
 
         assert x.shape[0] == result.shape[0], \
             f"Result b_out must equal b_in! {(x.shape, result.shape)}"
@@ -96,7 +123,9 @@ def model_outputs_to_probabilities(outputs, include_pedals=True):
 
     The DNN predicts ``t-1`` frames because it uses first-order differences.
     Padding is applied *after* sigmoid so the synthetic first frame is zero,
-    not 0.5. This avoids false first-frame note or pedal events.
+    not 0.5. This avoids false first-frame note or pedal events.  Pedal logits
+    may be either legacy state-only ``(b, 1, t-1)`` or the newer explicit
+    sustain ``(state, onset, offset)`` channels ``(b, 3, t-1)``.
     """
     if len(outputs) < 2:
         raise ValueError("model outputs must include at least onsets and velocities")
@@ -309,13 +338,18 @@ class PedalDecoder(torch.nn.Module):
     """
 
     def __init__(self, num_pedals=3, threshold=0.5, hysteresis=0.1,
-                 min_hold_steps=2, smoothing_window=3):
+                 min_hold_steps=2, smoothing_window=3,
+                 onset_threshold=None, offset_threshold=None):
         """
         :param num_pedals: Number of pedal types (default: 3 for sustain, soft, tenuto)
         :param threshold: Probability threshold for pedal activation
         :param hysteresis: Margin used to avoid rapid chatter around the threshold
         :param min_hold_steps: Minimum number of frames a state must persist before changing
         :param smoothing_window: Small moving-average window for the probability sequence
+        :param onset_threshold: Threshold for explicit pedal-down transition
+          channels. Defaults to ``threshold``.
+        :param offset_threshold: Threshold for explicit pedal-up transition
+          channels. Defaults to ``threshold``.
         """
         super().__init__()
         self.num_pedals = num_pedals
@@ -323,6 +357,8 @@ class PedalDecoder(torch.nn.Module):
         self.hysteresis = hysteresis
         self.min_hold_steps = max(1, int(min_hold_steps))
         self.smoothing_window = max(1, int(smoothing_window))
+        self.onset_threshold = threshold if onset_threshold is None else onset_threshold
+        self.offset_threshold = threshold if offset_threshold is None else offset_threshold
         if self.smoothing_window % 2 == 0:
             self.smoothing_window += 1
 
@@ -399,18 +435,87 @@ class PedalDecoder(torch.nn.Module):
 
         return {"onsets": onsets, "offsets": offsets, "states": states}
 
+    @staticmethod
+    def _local_max_mask(probs, threshold):
+        """Return a boolean mask of thresholded temporal local maxima."""
+        if probs.shape[-1] <= 1:
+            return probs >= threshold
+        flat = probs.reshape(-1, 1, probs.shape[-1])
+        pooled = F.max_pool1d(flat, kernel_size=3, stride=1, padding=1)
+        pooled = pooled.reshape_as(probs)
+        return (probs >= threshold) & (probs >= pooled)
+
+    def detect_explicit_transition_heads(self, probs):
+        """Decode ``[state, onset, offset]`` channel groups into events.
+
+        The model can output three channels per sustain pedal.  Onset/offset
+        heads are decoded directly with local-maximum thresholding, then an
+        alternating state machine suppresses duplicate chatter and impossible
+        event orders.  The state head is kept for frame-level monitoring and for
+        initializing the decoded state, but it is not used as a fallback event
+        source; explicit transition heads own event timing.
+        """
+        batch_size, channels, num_steps = probs.shape
+        grouped = probs.reshape(batch_size, self.num_pedals, 3, num_steps)
+        state_probs = grouped[:, :, 0]
+        raw_onset_probs = grouped[:, :, 1]
+        raw_offset_probs = grouped[:, :, 2]
+        onset_probs = 0.7 * raw_onset_probs + 0.3 * self._smooth_probs(raw_onset_probs)
+        offset_probs = 0.7 * raw_offset_probs + 0.3 * self._smooth_probs(raw_offset_probs)
+
+        onset_candidates = self._local_max_mask(onset_probs, self.onset_threshold)
+        offset_candidates = self._local_max_mask(offset_probs, self.offset_threshold)
+
+        states = torch.zeros((batch_size, self.num_pedals, num_steps),
+                             device=probs.device, dtype=torch.float32)
+        onsets = torch.zeros((batch_size, self.num_pedals, num_steps),
+                             device=probs.device, dtype=torch.bool)
+        offsets = torch.zeros((batch_size, self.num_pedals, num_steps),
+                              device=probs.device, dtype=torch.bool)
+        prev_states = (state_probs[..., 0] >= self.threshold).to(dtype=torch.float32)
+        last_change = torch.full((batch_size, self.num_pedals), -self.min_hold_steps,
+                                 device=probs.device, dtype=torch.long)
+
+        for step in range(num_steps):
+            next_states = prev_states.clone()
+            for batch_idx in range(batch_size):
+                for pedal_idx in range(self.num_pedals):
+                    prev_state = int(prev_states[batch_idx, pedal_idx])
+                    time_since_change = step - int(last_change[batch_idx, pedal_idx])
+                    has_onset = bool(onset_candidates[batch_idx, pedal_idx, step])
+                    has_offset = bool(offset_candidates[batch_idx, pedal_idx, step])
+
+                    if prev_state == 0:
+                        if has_onset and time_since_change >= self.min_hold_steps:
+                            next_states[batch_idx, pedal_idx] = 1.0
+                            onsets[batch_idx, pedal_idx, step] = True
+                            last_change[batch_idx, pedal_idx] = step
+                    elif prev_state == 1:
+                        if has_offset and time_since_change >= self.min_hold_steps:
+                            next_states[batch_idx, pedal_idx] = 0.0
+                            offsets[batch_idx, pedal_idx, step] = True
+                            last_change[batch_idx, pedal_idx] = step
+            states[..., step] = next_states
+            prev_states = next_states
+
+        return {"onsets": onsets, "offsets": offsets, "states": states}
+
     def forward(self, pedal_logits):
         """
         :param pedal_logits: Tensor of shape (b, num_pedals, t) with raw logits
         :returns: Dictionary with pedal events for each batch and pedal type
         """
         b, p, t = pedal_logits.shape
-        assert p == self.num_pedals, \
-            f"Expected {self.num_pedals} pedals, got {p}"
+        valid_channels = {self.num_pedals, self.num_pedals * 3}
+        assert p in valid_channels, \
+            f"Expected {self.num_pedals} state channel(s) or {self.num_pedals * 3} state/onset/offset channels, got {p}"
 
         with torch.no_grad():
             probs = self.logits_to_probs(pedal_logits)
-            transitions = self.detect_transitions(probs)
+            if p == self.num_pedals * 3:
+                transitions = self.detect_explicit_transition_heads(probs)
+            else:
+                transitions = self.detect_transitions(probs)
 
         batch_indices, pedal_indices, time_indices = transitions["onsets"].nonzero(as_tuple=True)
         onset_df = pd.DataFrame({
