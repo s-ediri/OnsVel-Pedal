@@ -5,7 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>OnV+Pedal: Piano Transcription</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
-    <script src="https://unpkg.com/tone@14.7.77/build/Tone.js"></script>
 </head>
 <body>
     <div class="container">
@@ -57,15 +56,25 @@
                 <h2>Transcription Results</h2>
                 <div class="results-controls">
                     <button id="play-btn" class="button">Play Transcription</button>
+                    <label class="audio-source-control" for="audio-source-select">
+                        Playback source
+                        <select id="audio-source-select" disabled>
+                            <option value="original">Original audio</option>
+                            <option value="generated">Generated grand piano</option>
+                        </select>
+                    </label>
+                    <p id="sync-status" class="sync-status warning">Transcribe audio to prepare synced playback sources.</p>
                 </div>
                 <section class="piano-roll-panel" aria-labelledby="piano-roll-title">
                     <div class="piano-roll-header">
                         <div>
                             <h3 id="piano-roll-title">Piano roll</h3>
-                            <p>Notes are shown as black bars. Sustain-pedal holds are blue bands at the bottom.</p>
+                            <p>Notes are color-coded by velocity: green is soft, yellow is medium, red is loud. Note lengths are estimated from onset-only predictions; sustain-pedal holds are cyan bands at the bottom.</p>
                         </div>
                         <div class="piano-roll-legend" aria-label="Piano roll legend">
-                            <span><i class="legend-note"></i> Notes</span>
+                            <span><i class="legend-note-soft"></i> Soft note</span>
+                            <span><i class="legend-note-medium"></i> Medium note</span>
+                            <span><i class="legend-note-loud"></i> Loud note</span>
                             <span><i class="legend-pedal"></i> Sustain held</span>
                             <span><i class="legend-pedal-onset"></i> Pedal onset</span>
                             <span><i class="legend-pedal-offset"></i> Pedal offset</span>

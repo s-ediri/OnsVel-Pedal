@@ -43,6 +43,25 @@ ModelFactory = Callable[..., torch.nn.Module]
 LOGGER = logging.getLogger(__name__)
 OPUS_SIGNATURE_SCAN_BYTES = 64 * 1024
 WINDOWS_DLL_LOAD_FAILURE_CODES = ("3221225781", "-1073741515", "0xc0000135")
+PEDAL_BRANCH_KEY_PREFIXES = (
+    "pedal_stage.",
+    "pedal_state_head.",
+    "pedal_onset_head.",
+    "pedal_offset_head.",
+)
+PEDAL_EVENT_COLUMNS = ("batch_idx", "pedal_idx", "t_idx", "event_type")
+
+# The note model predicts onsets and velocities only; it does not emit note-off
+# times. These constants define conservative, clearly-marked display/MIDI note
+# length estimates used by the web app and CLI output writers.
+DEFAULT_ESTIMATED_NOTE_DURATION_SECS = 1.0
+MIN_ESTIMATED_NOTE_DURATION_SECS = 0.08
+REPEATED_NOTE_GAP_SECS = 0.024
+
+# Missing pedal-up events are unreliable. Cap only estimated/open-ended pedal
+# holds so one false/missed offset does not sustain the rest of the piece.
+MAX_ESTIMATED_PEDAL_HOLD_SECS = 6.0
+MIN_PEDAL_INTERVAL_SECS = 0.05
 
 
 def _default_device() -> str:
@@ -80,7 +99,12 @@ class TranscriptionConfig:
 
     # Pedal decoder.
     num_pedals: int = 1
-    pedal_threshold: float = 0.5
+    pedal_threshold: float = 0.7
+    pedal_hysteresis: float = 0.1
+    pedal_min_hold_secs: float = 0.15
+    pedal_smoothing_window: int = 5
+    pedal_onset_threshold: Optional[float] = None
+    pedal_offset_threshold: Optional[float] = None
 
     @property
     def key_beg(self) -> int:
@@ -141,6 +165,16 @@ class TranscriptionConfig:
             raise ValueError("num_pedals must be positive")
         if not 0 <= self.pedal_threshold <= 1:
             raise ValueError("pedal_threshold must be in [0, 1]")
+        if not 0 <= self.pedal_hysteresis <= 1:
+            raise ValueError("pedal_hysteresis must be in [0, 1]")
+        if self.pedal_min_hold_secs < 0:
+            raise ValueError("pedal_min_hold_secs must be non-negative")
+        if int(self.pedal_smoothing_window) <= 0:
+            raise ValueError("pedal_smoothing_window must be positive")
+        if self.pedal_onset_threshold is not None and not 0 <= self.pedal_onset_threshold <= 1:
+            raise ValueError("pedal_onset_threshold must be in [0, 1]")
+        if self.pedal_offset_threshold is not None and not 0 <= self.pedal_offset_threshold <= 1:
+            raise ValueError("pedal_offset_threshold must be in [0, 1]")
 
 
 @dataclass
@@ -150,6 +184,180 @@ class TranscriptionResult:
     notes: pd.DataFrame
     pedal_events: pd.DataFrame
     logmel: Optional[torch.Tensor] = None
+
+
+def empty_pedal_events_df() -> pd.DataFrame:
+    """Return an empty pedal-event table with the standard schema."""
+    return pd.DataFrame(columns=list(PEDAL_EVENT_COLUMNS))
+
+
+def _coerce_finite_float(value, default: float = 0.0) -> float:
+    """Best-effort conversion of numpy/pandas/torch scalar values to a finite float."""
+    try:
+        if hasattr(value, "item"):
+            value = value.item()
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if np.isfinite(number) else default
+
+
+def estimate_note_intervals(
+    notes_df: pd.DataFrame,
+    secs_per_frame: float,
+    key_beg: int = 0,
+    fallback_duration_secs: float = DEFAULT_ESTIMATED_NOTE_DURATION_SECS,
+    min_duration_secs: float = MIN_ESTIMATED_NOTE_DURATION_SECS,
+    repeated_note_gap_secs: float = REPEATED_NOTE_GAP_SECS,
+    total_duration_secs: Optional[float] = None,
+):
+    """Convert onset-only note rows into estimated frontend/MIDI intervals.
+
+    The neural model predicts note onsets and velocities, not note-off frames.
+    This helper therefore estimates note lengths while making that fact explicit
+    with ``duration_estimated=True``.  Durations are capped by the next onset of
+    the same key to avoid overlapping repeated notes.  They are intentionally not
+    shortened to the analysis-window end, so final notes can display/play with a
+    natural estimated tail.
+    """
+    required_columns = {"key", "t_idx"}
+    if (
+        notes_df is None
+        or notes_df.empty
+        or not required_columns.issubset(notes_df.columns)
+        or secs_per_frame <= 0
+    ):
+        return []
+
+    fallback_duration_secs = max(min_duration_secs, float(fallback_duration_secs))
+    min_duration_secs = max(0.001, float(min_duration_secs))
+    repeated_note_gap_secs = max(0.0, float(repeated_note_gap_secs))
+
+    candidates = []
+    for row_position, (_, row) in enumerate(notes_df.iterrows()):
+        key = int(_coerce_finite_float(row.get("key"), 0.0))
+        batch_idx = int(_coerce_finite_float(row.get("batch_idx"), 0.0))
+        start = _coerce_finite_float(row.get("t_idx"), 0.0) * secs_per_frame
+        if start < 0:
+            continue
+        velocity = _coerce_finite_float(row.get("vel", 0.8), 0.8)
+        candidates.append(
+            {
+                "row_position": row_position,
+                "batch_idx": batch_idx,
+                "key": key,
+                "pitch": int(key + key_beg),
+                "start": float(start),
+                "velocity": float(max(0.0, min(1.0, velocity))),
+                "next_same_key_start": None,
+            }
+        )
+
+    grouped = {}
+    for idx, note in enumerate(candidates):
+        grouped.setdefault((note["batch_idx"], note["key"]), []).append(idx)
+
+    for group_indices in grouped.values():
+        group_indices.sort(key=lambda idx: candidates[idx]["start"])
+        for current_idx, next_idx in zip(group_indices[:-1], group_indices[1:]):
+            candidates[current_idx]["next_same_key_start"] = candidates[next_idx]["start"]
+
+    intervals = []
+    for note in sorted(candidates, key=lambda item: (item["start"], item["pitch"], item["row_position"])):
+        start = note["start"]
+        duration = fallback_duration_secs
+
+        next_same_key_start = note.pop("next_same_key_start")
+        if next_same_key_start is not None:
+            duration = min(
+                duration,
+                max(min_duration_secs, next_same_key_start - start - repeated_note_gap_secs),
+            )
+
+        if duration <= 0:
+            continue
+
+        duration = max(min_duration_secs, duration)
+
+        note["duration"] = float(duration)
+        note["duration_estimated"] = True
+        note.pop("row_position", None)
+        note.pop("batch_idx", None)
+        note.pop("key", None)
+        intervals.append(note)
+
+    return intervals
+
+
+def paired_pedal_intervals(
+    events_df: pd.DataFrame,
+    secs_per_frame: float,
+    fallback_end_secs: Optional[float] = None,
+    max_estimated_duration_secs: Optional[float] = MAX_ESTIMATED_PEDAL_HOLD_SECS,
+    min_duration_secs: float = MIN_PEDAL_INTERVAL_SECS,
+):
+    """Return sustain-pedal hold intervals from decoded onset/offset events.
+
+    Explicit offsets are preserved.  If a final onset has no matching offset, the
+    interval is kept visible but marked as estimated and capped, preventing one
+    missed pedal-up event from sustaining the rest of a long transcription.
+    """
+    required_columns = set(PEDAL_EVENT_COLUMNS) - {"batch_idx"}
+    if (
+        events_df is None
+        or events_df.empty
+        or not required_columns.issubset(events_df.columns)
+        or secs_per_frame <= 0
+    ):
+        return []
+
+    fallback_end = None
+    if fallback_end_secs is not None:
+        fallback_end = max(0.0, float(fallback_end_secs))
+    max_estimated_duration = None
+    if max_estimated_duration_secs is not None:
+        max_estimated_duration = max(0.0, float(max_estimated_duration_secs))
+    min_duration_secs = max(0.0, float(min_duration_secs))
+
+    intervals = []
+    for pedal_idx, group in events_df.groupby("pedal_idx"):
+        onsets = sorted(group[group["event_type"] == "onset"]["t_idx"].values)
+        offsets = sorted(group[group["event_type"] == "offset"]["t_idx"].values)
+
+        offset_cursor = 0
+        for onset_frame in onsets:
+            while offset_cursor < len(offsets) and offsets[offset_cursor] <= onset_frame:
+                offset_cursor += 1
+
+            start = float(onset_frame * secs_per_frame)
+            offset_estimated = False
+            if offset_cursor < len(offsets):
+                end = float(offsets[offset_cursor] * secs_per_frame)
+                offset_cursor += 1
+            else:
+                offset_estimated = True
+                estimated_end_candidates = []
+                if fallback_end is not None:
+                    estimated_end_candidates.append(fallback_end)
+                if max_estimated_duration is not None and max_estimated_duration > 0:
+                    estimated_end_candidates.append(start + max_estimated_duration)
+                if not estimated_end_candidates:
+                    break
+                end = min(estimated_end_candidates)
+
+            duration = end - start
+            if duration < min_duration_secs:
+                continue
+
+            intervals.append({
+                "pedal_idx": int(pedal_idx),
+                "start": start,
+                "end": end,
+                "duration": duration,
+                "offset_estimated": offset_estimated,
+            })
+
+    return intervals
 
 
 class AudioPreprocessingError(ValueError):
@@ -186,7 +394,30 @@ def build_note_decoder(config: TranscriptionConfig) -> OnsetVelocityNmsDecoder:
 
 def build_pedal_decoder(config: TranscriptionConfig) -> PedalDecoder:
     """Create the pedal event decoder for a transcription configuration."""
-    return PedalDecoder(num_pedals=config.num_pedals, threshold=config.pedal_threshold)
+    min_hold_steps = max(1, round(config.pedal_min_hold_secs / config.secs_per_frame))
+    return PedalDecoder(
+        num_pedals=config.num_pedals,
+        threshold=config.pedal_threshold,
+        hysteresis=config.pedal_hysteresis,
+        min_hold_steps=min_hold_steps,
+        smoothing_window=config.pedal_smoothing_window,
+        onset_threshold=config.pedal_onset_threshold,
+        offset_threshold=config.pedal_offset_threshold,
+    )
+
+
+def _load_report_has_complete_pedal_branch(load_report) -> bool:
+    """Return False when a checkpoint left any pedal-branch parameters random."""
+    if not load_report:
+        return True
+    for key in load_report.get("missing_keys", []):
+        if key.startswith(PEDAL_BRANCH_KEY_PREFIXES):
+            return False
+    for item in load_report.get("shape_mismatched_keys", []):
+        key = item.get("key", "") if isinstance(item, dict) else str(item)
+        if key.startswith(PEDAL_BRANCH_KEY_PREFIXES):
+            return False
+    return True
 
 
 def build_transcription_model(
@@ -219,8 +450,15 @@ def load_transcription_model(
         to_cpu=str(config.device).startswith("cpu"),
         strict=False,
     )
+    model._onsvel_pedal_branch_loaded = _load_report_has_complete_pedal_branch(load_report)
     for warning in format_load_model_warnings(load_report):
         LOGGER.warning("CHECKPOINT LOAD WARNING: %s", warning)
+    if not model._onsvel_pedal_branch_loaded:
+        LOGGER.warning(
+            "Checkpoint %s does not contain a complete trained pedal branch; "
+            "sustain-pedal decoding will be disabled for this model to avoid random pedal overuse.",
+            snapshot_path,
+        )
     return model
 
 
@@ -759,12 +997,15 @@ def run_inference_and_decode(
         pedal_decoder = build_pedal_decoder(config)
 
     notes_df = note_decoder(onset_pred, vel_pred, pthresh=config.note_threshold)
-    pedal_pred = normalize_pedal_prediction_shape(
-        pedal_pred,
-        num_pedals=config.num_pedals,
-        batch_size=logmel.shape[0],
-    )
-    pedal_events_df, _, _ = pedal_decoder(pedal_pred)
+    if getattr(model, "_onsvel_pedal_branch_loaded", True) is False:
+        pedal_events_df = empty_pedal_events_df()
+    else:
+        pedal_pred = normalize_pedal_prediction_shape(
+            pedal_pred,
+            num_pedals=config.num_pedals,
+            batch_size=logmel.shape[0],
+        )
+        pedal_events_df, _, _ = pedal_decoder(pedal_pred)
 
     return TranscriptionResult(notes=notes_df, pedal_events=pedal_events_df, logmel=logmel)
 

@@ -1,7 +1,9 @@
 from collections import OrderedDict
 from io import BytesIO
 import os
+import wave
 
+import numpy as np
 import pandas as pd
 import pytest
 import torch
@@ -11,10 +13,19 @@ from web_app import app as web_app
 
 
 @pytest.fixture(autouse=True)
-def clear_model_cache():
+def clear_model_cache(tmp_path, monkeypatch):
     web_app._model_cache.clear()
+    web_app._grand_piano_sample_cache.clear()
+    monkeypatch.setattr(web_app.CONF, "GENERATED_AUDIO_DIR", str(tmp_path / "generated_audio"))
+    grand_piano_sample = torch.linspace(0, 0.8, steps=4096).numpy().astype("float32")
+    monkeypatch.setattr(
+        web_app,
+        "_load_nearest_grand_piano_sample",
+        lambda pitch, sample_rate: (60, grand_piano_sample),
+    )
     yield
     web_app._model_cache.clear()
+    web_app._grand_piano_sample_cache.clear()
 
 
 @pytest.fixture
@@ -28,6 +39,25 @@ def _upload(audio_bytes=b"fake wav bytes", model="model.torch"):
         "audio": (BytesIO(audio_bytes), "audio.wav"),
         "model": model,
     }
+
+
+def _wav_bytes(samples, sample_rate=8_000):
+    samples = np.asarray(samples, dtype=np.float32).reshape(-1)
+    pcm = (np.clip(samples, -1.0, 1.0) * 32767.0).astype("<i2")
+    buffer = BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm.tobytes())
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _wav_response_samples(response_data):
+    with wave.open(BytesIO(response_data), "rb") as wav_file:
+        frames = wav_file.readframes(wav_file.getnframes())
+    return np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
 
 
 def _tiny_transcription_result():
@@ -81,6 +111,7 @@ def test_index_shows_piano_roll_without_sheet_music_preview(client):
     assert "notation-preview-container" not in html
     assert "Approximate pitch preview" not in html
     assert "abcjs" not in html.lower()
+    assert "tone.js" not in html.lower()
 
 
 def test_api_transcribe_requires_audio_file(client):
@@ -295,7 +326,7 @@ def test_api_transcribe_success_with_mocked_inference(client, tmp_path, monkeypa
             "pitch": 60,
             "start": pytest.approx(0.048),
             "velocity": 0.75,
-            "duration": 0.4,
+            "duration": 1.0,
             "duration_estimated": True,
         }
     ]
@@ -309,6 +340,124 @@ def test_api_transcribe_success_with_mocked_inference(client, tmp_path, monkeypa
         }
     ]
     assert payload["duration"] == pytest.approx(0.192)
+    assert payload["generated_audio"]["url"].startswith("/api/generated-audio/piano_")
+    assert payload["generated_audio"]["url"].endswith(".wav")
+    assert payload["generated_audio"]["sample_rate"] == web_app.CONF.GENERATED_AUDIO_SAMPLE_RATE
+    assert payload["generated_audio"]["engine"] == "server-sampled-grand-piano-salamander-v1"
+    assert payload["generated_audio"]["latency_seconds"] == pytest.approx(0.0)
+    assert payload["generated_audio"]["duration"] >= payload["duration"]
+    assert payload["generated_audio"]["balance"]["applied"] is False
+
+    audio_response = client.get(payload["generated_audio"]["url"])
+    assert audio_response.status_code == 200
+    assert audio_response.mimetype == "audio/wav"
+    with wave.open(BytesIO(audio_response.data), "rb") as wav_file:
+        assert wav_file.getnchannels() == 1
+        assert wav_file.getsampwidth() == 2
+        assert wav_file.getframerate() == web_app.CONF.GENERATED_AUDIO_SAMPLE_RATE
+        assert wav_file.getnframes() > 0
+
+
+def test_api_transcribe_balances_generated_audio_to_uploaded_wav(client, tmp_path, monkeypatch):
+    model_path = tmp_path / "model.torch"
+    model_path.write_bytes(b"checkpoint")
+    model = object()
+    logmel = torch.zeros(1, 4, 8)
+    target_rms = 0.04
+
+    monkeypatch.setattr(
+        web_app,
+        "_available_checkpoints",
+        lambda: OrderedDict([("model.torch", str(model_path))]),
+    )
+    monkeypatch.setattr(web_app.transcriber, "preprocess_audio", lambda *_args, **_kwargs: logmel)
+    monkeypatch.setattr(web_app.transcriber, "load_model", lambda snapshot_path: model)
+    monkeypatch.setattr(
+        web_app.transcriber,
+        "run_inference_and_decode",
+        lambda loaded_model, processed_logmel: _tiny_transcription_result(),
+    )
+
+    response = client.post(
+        "/api/transcribe",
+        data=_upload(audio_bytes=_wav_bytes(np.full(8_000, target_rms, dtype=np.float32))),
+        content_type="multipart/form-data",
+    )
+
+    payload = response.get_json()
+    assert response.status_code == 200
+    balance = payload["generated_audio"]["balance"]
+    assert balance["applied"] is True
+    assert balance["reference_active_rms"] == pytest.approx(target_rms, rel=0.02)
+    assert balance["rendered_active_rms_after"] == pytest.approx(target_rms, rel=0.08)
+    assert balance["gain"] < 1.0
+
+    audio_response = client.get(payload["generated_audio"]["url"])
+    assert audio_response.status_code == 200
+    generated_samples = _wav_response_samples(audio_response.data)
+    assert web_app._audio_level_stats(generated_samples)["active_rms"] == pytest.approx(target_rms, rel=0.08)
+
+
+def test_generate_piano_audio_artifact_writes_zero_latency_wav(tmp_path, monkeypatch):
+    monkeypatch.setattr(web_app.CONF, "GENERATED_AUDIO_DIR", str(tmp_path))
+    monkeypatch.setattr(web_app.CONF, "GENERATED_AUDIO_SAMPLE_RATE", 8_000)
+    notes = [
+        {
+            "pitch": 60,
+            "start": 0.125,
+            "duration": 0.25,
+            "velocity": 0.8,
+        }
+    ]
+    pedals = [
+        {
+            "pedal_idx": 0,
+            "start": 0.2,
+            "end": 0.55,
+            "duration": 0.35,
+            "offset_estimated": False,
+        }
+    ]
+
+    generated_audio = web_app._generate_piano_audio_artifact(notes, pedals, duration_secs=0.6)
+
+    assert generated_audio["url"].startswith("/api/generated-audio/piano_")
+    assert generated_audio["sample_rate"] == 8_000
+    assert generated_audio["engine"] == "server-sampled-grand-piano-salamander-v1"
+    assert generated_audio["latency_seconds"] == pytest.approx(0.0)
+    filename = generated_audio["url"].rsplit("/", 1)[-1]
+    wav_path = tmp_path / filename
+    assert wav_path.is_file()
+    with wave.open(str(wav_path), "rb") as wav_file:
+        assert wav_file.getnchannels() == 1
+        assert wav_file.getsampwidth() == 2
+        assert wav_file.getframerate() == 8_000
+        assert wav_file.getnframes() == pytest.approx(generated_audio["duration"] * 8_000, abs=1)
+        frames = wav_file.readframes(wav_file.getnframes())
+    assert any(byte != 0 for byte in frames)
+
+
+def test_analyze_reference_audio_balance_measures_wav_and_rewinds():
+    target_rms = 0.2
+    source = BytesIO(_wav_bytes(np.full(4_000, target_rms, dtype=np.float32)))
+
+    balance = web_app._analyze_reference_audio_balance(source)
+
+    assert balance["usable"] is True
+    assert balance["sample_rate"] == 8_000
+    assert balance["active_rms"] == pytest.approx(target_rms, rel=0.02)
+    assert source.tell() == 0
+
+
+def test_balance_generated_audio_to_reference_matches_active_rms():
+    generated = np.full(1_000, 0.1, dtype=np.float32)
+    reference = {"usable": True, "active_rms": 0.25}
+
+    balanced, balance = web_app._balance_generated_audio_to_reference(generated, reference)
+
+    assert balance["applied"] is True
+    assert balance["gain"] == pytest.approx(2.5)
+    assert web_app._audio_level_stats(balanced)["active_rms"] == pytest.approx(0.25)
 
 
 def test_format_results_extends_unclosed_pedal_to_transcription_end():

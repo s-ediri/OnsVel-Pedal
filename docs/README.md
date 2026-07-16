@@ -1,9 +1,5 @@
 # OnV+Pedal: Pedal-Aware Piano Onset, Velocity, and Sustain Pedal Prediction
 
-<p align="center">
-<img src="assets/qualitative_plot_bone_small.png" alt="Pedal-aware piano transcription input/output example" width="60.0%"/>
-</p>
-
 This repository contains a pedal-focused adaptation of a piano transcription pipeline for predicting onsets, velocities, and sustain pedal events from audio. It builds on the original onset/velocity training framework from the iamusica_training project, but it has been substantially reworked and extended to make sustain-pedal prediction a first-class objective.
 
 The project is designed to:

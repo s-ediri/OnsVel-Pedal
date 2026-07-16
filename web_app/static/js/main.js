@@ -29,6 +29,8 @@ document.addEventListener("DOMContentLoaded", () => {
     const loadingSpinner = document.getElementById("loading-spinner");
     const resultsDiv = document.getElementById("results");
     const playBtn = document.getElementById("play-btn");
+    const audioSourceSelect = document.getElementById("audio-source-select");
+    const syncStatus = document.getElementById("sync-status");
     const canvas = document.getElementById("piano-roll-canvas");
     const ctx = canvas.getContext("2d");
     const pianoRollContainer = canvas.parentElement;
@@ -67,15 +69,19 @@ document.addEventListener("DOMContentLoaded", () => {
     let transcriptionData = null;
     let isTranscribing = false;
     let currentRequest = null;
-    let playbackSynth = null;
     let playbackAnimationRequest = null;
     let playbackState = "stopped";
     let playbackMode = "none";
     let playbackPosition = 0;
     let playbackDuration = 0;
-    let synthPlaybackClockStartTime = 0;
     let audioElement = null;
     let audioObjectUrl = null;
+    let generatedAudioElement = null;
+    let generatedAudioUrl = null;
+    let generatedAudioBalanceInfo = null;
+    let activeAudioSource = "original";
+    let audioSourceFadeRequest = null;
+    let lastAudioSyncCorrectionTime = 0;
     let pianoRollSpacer = null;
     let pianoRollFrameRequest = null;
     let pianoRollState = null;
@@ -87,7 +93,31 @@ document.addEventListener("DOMContentLoaded", () => {
     const PIANO_ROLL_MAX_BACKING_WIDTH = 2400;
     const PIANO_ROLL_RESIZE_DEBOUNCE_MS = 100;
     const PIANO_ROLL_PEDAL_LANE_HEIGHT = 42;
-    const PLAYHEAD_COLOR = "#f97316";
+    const PIANO_ROLL_THEME = {
+        background: "#07101f",
+        octaveLine: "rgba(148, 163, 184, 0.36)",
+        timeLine: "rgba(148, 163, 184, 0.22)",
+        text: "#d7e3f3",
+        mutedText: "#a8b3c7",
+        textHalo: "rgba(7, 16, 31, 0.86)",
+        pedalLaneBackground: "#0b1d32",
+        pedalLaneText: "#dbeafe",
+        pedalFill: "rgba(56, 189, 248, 0.24)",
+        pedalBorder: "rgba(56, 189, 248, 0.62)",
+        pedalOnset: "rgba(34, 197, 94, 0.95)",
+        pedalOffset: "rgba(248, 113, 113, 0.9)",
+        playhead: "#f59e0b",
+        playheadShadow: "rgba(245, 158, 11, 0.38)",
+        playheadLabel: "rgba(245, 158, 11, 0.95)",
+        playheadText: "#0b1120",
+    };
+    const PLAYHEAD_COLOR = PIANO_ROLL_THEME.playhead;
+    const ACTIVE_AUDIO_VOLUME = 1;
+    const INACTIVE_AUDIO_VOLUME = 0;
+    const AUDIO_SOURCE_SWITCH_FADE_MS = 80;
+    const AUDIO_SYNC_TOLERANCE_SECS = 0.012;
+    const AUDIO_SYNC_CHECK_INTERVAL_MS = 80;
+    const GENERATED_AUDIO_ENGINE_NAME = "pre-rendered sampled grand piano WAV";
 
     // --- Initialization ---
     const init = async () => {
@@ -185,6 +215,11 @@ document.addEventListener("DOMContentLoaded", () => {
         transcribeBtn.addEventListener("click", handleTranscribe);
         cancelBtn.addEventListener("click", cancelTranscription);
         playBtn.addEventListener("click", togglePlayback);
+        if (audioSourceSelect) {
+            audioSourceSelect.addEventListener("change", () => {
+                switchPlaybackAudioSource(audioSourceSelect.value);
+            });
+        }
         pianoRollContainer.addEventListener("click", handlePianoRollSeek);
         pianoRollContainer.addEventListener("scroll", requestPianoRollRender);
         window.addEventListener("resize", handlePianoRollResize);
@@ -292,6 +327,7 @@ document.addEventListener("DOMContentLoaded", () => {
         audioBlob = null;
         transcriptionData = null;
         clearAudioPlaybackSource();
+        clearGeneratedAudioPlaybackSource(false);
         resultsDiv.style.display = "none";
         audioFileInput.value = "";
         fileNameSpan.textContent = " or drag and drop an audio file here";
@@ -301,17 +337,22 @@ document.addEventListener("DOMContentLoaded", () => {
     function prepareAudioPlaybackSource(blob) {
         stopPlayback(true);
         clearAudioPlaybackSource(false);
+        clearGeneratedAudioPlaybackSource(false);
+        activeAudioSource = "original";
 
         if (!blob) return;
 
         audioObjectUrl = URL.createObjectURL(blob);
         audioElement = new Audio(audioObjectUrl);
         audioElement.preload = "metadata";
-        audioElement.addEventListener("ended", handleSourceAudioEnded);
-        audioElement.addEventListener("loadedmetadata", handleSourceAudioMetadataLoaded);
+        audioElement.volume = activeAudioSource === "original" ? ACTIVE_AUDIO_VOLUME : INACTIVE_AUDIO_VOLUME;
+        audioElement.addEventListener("ended", () => handleMediaAudioEnded("original"));
+        audioElement.addEventListener("loadedmetadata", handleMediaAudioMetadataLoaded);
         audioElement.addEventListener("error", () => {
             console.warn("Uploaded audio could not be loaded for synchronized playback.");
+            updateAudioSourceControls();
         });
+        updateAudioSourceControls();
         updatePlayButton();
     }
 
@@ -334,16 +375,81 @@ document.addEventListener("DOMContentLoaded", () => {
         updatePlayButton();
     }
 
+    function prepareGeneratedAudioPlaybackSource(generatedAudio) {
+        clearGeneratedAudioPlaybackSource(false);
+        generatedAudioBalanceInfo = generatedAudio && generatedAudio.balance
+            ? generatedAudio.balance
+            : null;
+
+        const url = generatedAudio && typeof generatedAudio.url === "string"
+            ? generatedAudio.url
+            : "";
+        if (!url) {
+            const message = generatedAudio && generatedAudio.error
+                ? generatedAudio.error
+                : "Generated piano audio was not rendered; playback will use the original audio if possible.";
+            updateAudioSourceControls(message);
+            return;
+        }
+
+        generatedAudioUrl = url;
+        activeAudioSource = "generated";
+        generatedAudioElement = new Audio(generatedAudioUrl);
+        generatedAudioElement.preload = "auto";
+        generatedAudioElement.volume = activeAudioSource === "generated" ? ACTIVE_AUDIO_VOLUME : INACTIVE_AUDIO_VOLUME;
+        generatedAudioElement.addEventListener("ended", () => handleMediaAudioEnded("generated"));
+        generatedAudioElement.addEventListener("loadedmetadata", handleMediaAudioMetadataLoaded);
+        generatedAudioElement.addEventListener("canplaythrough", () => updateAudioSourceControls());
+        generatedAudioElement.addEventListener("error", () => {
+            console.warn("Generated piano audio could not be loaded for synchronized playback.");
+            clearGeneratedAudioPlaybackSource(false);
+            updateAudioSourceControls("Generated piano audio could not be loaded.");
+        });
+        generatedAudioElement.load();
+        updateAudioSourceControls();
+    }
+
+    function clearGeneratedAudioPlaybackSource(stopExistingPlayback = true) {
+        if (stopExistingPlayback) {
+            stopPlayback(true);
+        }
+
+        if (generatedAudioElement) {
+            generatedAudioElement.pause();
+            generatedAudioElement.removeAttribute("src");
+            generatedAudioElement.load();
+            generatedAudioElement = null;
+        }
+        generatedAudioUrl = null;
+        if (activeAudioSource === "generated") {
+            activeAudioSource = hasPlayableSourceAudio() ? "original" : "generated";
+        }
+        updateAudioSourceControls();
+        updatePlayButton();
+    }
+
     function hasPlayableSourceAudio() {
         return Boolean(audioElement && audioObjectUrl);
     }
 
-    function handleSourceAudioEnded() {
-        if (playbackMode !== "audio") return;
+    function hasPlayableGeneratedAudioElement() {
+        return Boolean(generatedAudioElement && generatedAudioUrl);
+    }
+
+    function hasPlayableGeneratedAudio() {
+        return hasPlayableGeneratedAudioElement();
+    }
+
+    function hasPlayableMediaAudio() {
+        return hasPlayableSourceAudio() || hasPlayableGeneratedAudioElement();
+    }
+
+    function handleMediaAudioEnded(sourceName) {
+        if (playbackMode !== "audio" || sourceName !== activeAudioSource) return;
         stopPlayback(true);
     }
 
-    function handleSourceAudioMetadataLoaded() {
+    function handleMediaAudioMetadataLoaded() {
         if (!transcriptionData || !pianoRollState) return;
         playbackDuration = getVisualizationDuration(
             transcriptionData.notes,
@@ -356,7 +462,174 @@ document.addEventListener("DOMContentLoaded", () => {
             playbackDuration,
             false
         );
+        updateAudioSourceControls();
         updatePlayButton();
+    }
+
+    function updateAudioSourceControls(message = "", resetVolumes = true) {
+        const hasOriginal = hasPlayableSourceAudio();
+        const hasGenerated = hasPlayableGeneratedAudio();
+
+        if (activeAudioSource === "original" && !hasOriginal && hasGenerated) {
+            activeAudioSource = "generated";
+        } else if (activeAudioSource === "generated" && !hasGenerated && hasOriginal) {
+            activeAudioSource = "original";
+        }
+
+        if (audioSourceSelect) {
+            const originalOption = audioSourceSelect.querySelector("option[value='original']");
+            const generatedOption = audioSourceSelect.querySelector("option[value='generated']");
+            if (originalOption) originalOption.disabled = !hasOriginal;
+            if (generatedOption) generatedOption.disabled = !hasGenerated;
+            audioSourceSelect.value = activeAudioSource;
+            audioSourceSelect.disabled = isTranscribing || !(hasOriginal && hasGenerated);
+        }
+
+        if (resetVolumes) {
+            setMediaVolumesForActiveSource(false);
+        }
+
+        if (syncStatus) {
+            if (message) {
+                syncStatus.textContent = message;
+                syncStatus.className = "sync-status warning";
+            } else if (hasOriginal && hasGenerated) {
+                syncStatus.textContent = `Original audio and generated grand piano are ready. Both are media-synced to the piano roll using the ${GENERATED_AUDIO_ENGINE_NAME}.${getGeneratedAudioBalanceMessage()}`;
+                syncStatus.className = "sync-status ready";
+            } else if (hasGenerated) {
+                syncStatus.textContent = `Generated grand piano playback is ready via the ${GENERATED_AUDIO_ENGINE_NAME}.${getGeneratedAudioBalanceMessage()}`;
+                syncStatus.className = "sync-status warning";
+            } else {
+                syncStatus.textContent = "Generated grand piano playback is not available; playback will use the original audio if possible.";
+                syncStatus.className = "sync-status warning";
+            }
+        }
+    }
+
+    function getGeneratedAudioBalanceMessage() {
+        if (!generatedAudioBalanceInfo || typeof generatedAudioBalanceInfo !== "object") {
+            return "";
+        }
+
+        if (generatedAudioBalanceInfo.applied) {
+            const gain = Number(generatedAudioBalanceInfo.gain);
+            const gainMessage = Number.isFinite(gain) && gain > 0
+                ? ` (${formatGainDb(gain)})`
+                : "";
+            return ` Volume balanced to the original audio${gainMessage}.`;
+        }
+
+        const reason = generatedAudioBalanceInfo.reason || "";
+        if (reason === "disabled" || reason === "missing_reference") {
+            return "";
+        }
+        return " Volume balancing to the original audio was unavailable.";
+    }
+
+    function formatGainDb(gain) {
+        const safeGain = Math.max(Number(gain) || 0, 0.000001);
+        const db = 20 * Math.log10(safeGain);
+        const sign = db >= 0 ? "+" : "";
+        return `${sign}${db.toFixed(1)} dB`;
+    }
+
+    async function switchPlaybackAudioSource(requestedSource) {
+        const nextSource = requestedSource === "generated" ? "generated" : "original";
+        if (nextSource === "generated" && !hasPlayableGeneratedAudio()) {
+            updateAudioSourceControls("Generated grand piano playback is still loading or unavailable.");
+            return;
+        }
+        if (nextSource === "original" && !hasPlayableSourceAudio()) {
+            updateAudioSourceControls("Original audio is unavailable for synced playback.");
+            return;
+        }
+
+        const timelinePosition = getCurrentPlaybackPosition();
+        activeAudioSource = nextSource;
+        playbackPosition = clamp(timelinePosition, 0, playbackDuration || 0);
+        seekMediaAudio(playbackPosition);
+        updateAudioSourceControls("", false);
+        setMediaVolumesForActiveSource(true);
+        updatePlayButton();
+
+        if (playbackState === "playing") {
+            playBtn.disabled = true;
+            playBtn.textContent = "Syncing audio...";
+            try {
+                await startPlaybackFrom(playbackPosition, playbackDuration);
+            } catch (error) {
+                console.warn("Could not switch playback source:", error);
+                updateStatus(`Audio source switch failed: ${error.message}`, "error");
+                updatePlayButton();
+            } finally {
+                playBtn.disabled = false;
+            }
+        }
+
+        renderPianoRollViewport();
+    }
+
+    function getPlayableMediaAudioElements() {
+        const elements = [];
+        if (hasPlayableSourceAudio()) {
+            elements.push({ name: "original", element: audioElement });
+        }
+        if (hasPlayableGeneratedAudioElement()) {
+            elements.push({ name: "generated", element: generatedAudioElement });
+        }
+        return elements;
+    }
+
+    function getActiveAudioElement() {
+        if (activeAudioSource === "generated" && hasPlayableGeneratedAudioElement()) {
+            return generatedAudioElement;
+        }
+        if (hasPlayableSourceAudio()) {
+            return audioElement;
+        }
+        if (hasPlayableGeneratedAudioElement()) {
+            return generatedAudioElement;
+        }
+        return null;
+    }
+
+    function pauseMediaAudio() {
+        getPlayableMediaAudioElements().forEach(({ element }) => {
+            element.pause();
+        });
+    }
+
+    function setMediaVolumesForActiveSource(animated = true) {
+        if (audioSourceFadeRequest) {
+            window.cancelAnimationFrame(audioSourceFadeRequest);
+            audioSourceFadeRequest = null;
+        }
+
+        const mediaElements = getPlayableMediaAudioElements().map(({ name, element }) => ({
+            element,
+            startVolume: Number.isFinite(element.volume) ? element.volume : 0,
+            targetVolume: name === activeAudioSource ? ACTIVE_AUDIO_VOLUME : INACTIVE_AUDIO_VOLUME,
+        }));
+        if (!animated || mediaElements.length === 0 || AUDIO_SOURCE_SWITCH_FADE_MS <= 0) {
+            mediaElements.forEach(({ element, targetVolume }) => {
+                element.volume = targetVolume;
+            });
+            return;
+        }
+
+        const fadeStart = performance.now();
+        const step = (now) => {
+            const progress = clamp((now - fadeStart) / AUDIO_SOURCE_SWITCH_FADE_MS, 0, 1);
+            mediaElements.forEach(({ element, startVolume, targetVolume }) => {
+                element.volume = startVolume + (targetVolume - startVolume) * progress;
+            });
+            if (progress < 1) {
+                audioSourceFadeRequest = window.requestAnimationFrame(step);
+            } else {
+                audioSourceFadeRequest = null;
+            }
+        };
+        audioSourceFadeRequest = window.requestAnimationFrame(step);
     }
 
     function validateAudioFile(file) {
@@ -551,6 +824,7 @@ document.addEventListener("DOMContentLoaded", () => {
     function displayResults(data) {
         try {
             resultsDiv.style.display = "block";
+            prepareGeneratedAudioPlaybackSource(data.generated_audio);
             resetPlaybackForResults(data);
             drawPianoRoll(data.notes, data.pedals, data.duration);
         } catch (error) {
@@ -568,25 +842,20 @@ document.addEventListener("DOMContentLoaded", () => {
         }
 
         playBtn.disabled = true;
-        playBtn.textContent = "Starting audio...";
+        playBtn.textContent = "Starting synced audio...";
 
         try {
-            if (!hasPlayableSourceAudio()) {
-                if (typeof Tone === "undefined") {
-                    throw new Error("Tone.js is not available for synthesized transcription playback.");
-                }
-                // Browser autoplay policies require AudioContext startup from a user gesture.
-                await Tone.start();
+            if (!hasPlayableMediaAudio()) {
+                throw new Error("No original or generated audio source is available for synchronized playback.");
             }
 
-            const notes = getPlayableNotes();
             const duration = getVisualizationDuration(
                 transcriptionData.notes,
                 transcriptionData.pedals,
                 transcriptionData.duration
             );
             const startAt = playbackPosition >= duration ? 0 : playbackPosition;
-            await startPlaybackFrom(startAt, notes, duration);
+            await startPlaybackFrom(startAt, duration);
         } catch (error) {
             console.error("Playback start failed:", error);
             updateStatus(`Audio playback could not start: ${error.message}`, "error");
@@ -596,40 +865,46 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    async function startPlaybackFrom(position, notes = getPlayableNotes(), duration = playbackDuration) {
+    async function startPlaybackFrom(position, duration = playbackDuration) {
         const boundedDuration = Math.max(Number(duration) || 0, 0.01);
         playbackDuration = boundedDuration;
         playbackPosition = clamp(Number(position) || 0, 0, boundedDuration);
 
-        if (hasPlayableSourceAudio()) {
-            await startSourceAudioPlayback(playbackPosition, boundedDuration);
+        if (hasPlayableMediaAudio()) {
+            await startSynchronizedAudioPlayback(playbackPosition, boundedDuration);
             return;
         }
 
-        startSynthPlaybackFrom(playbackPosition, notes, boundedDuration);
+        throw new Error("No original or generated audio source is available for synchronized playback.");
     }
 
-    async function startSourceAudioPlayback(position, duration) {
+    async function startSynchronizedAudioPlayback(position, duration) {
         stopPlayback(false, false);
 
         playbackDuration = Math.max(Number(duration) || 0, 0.01);
         playbackPosition = clamp(Number(position) || 0, 0, playbackDuration);
         playbackMode = "audio";
 
-        await ensureSourceAudioMetadata();
-        seekSourceAudio(playbackPosition);
+        await ensureAvailableAudioMetadata();
+        seekMediaAudio(playbackPosition);
+        setMediaVolumesForActiveSource(false);
 
         playbackState = "playing";
         updatePlayButton();
+        updateAudioSourceControls();
         keepPlaybackPositionInView(playbackPosition, true);
         renderPianoRollViewport();
-        startPlaybackAnimation();
 
         try {
-            await audioElement.play();
+            const started = await playAvailableMediaAudio();
+            if (!started) {
+                throw new Error("No original or generated audio source is available for playback.");
+            }
+            startPlaybackAnimation();
         } catch (error) {
             playbackState = "paused";
             playbackMode = "none";
+            pauseMediaAudio();
             cancelPlaybackAnimation();
             updatePlayButton();
             renderPianoRollViewport();
@@ -637,62 +912,11 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    function startSynthPlaybackFrom(position, notes = getPlayableNotes(), duration = playbackDuration) {
-        const boundedDuration = Math.max(Number(duration) || 0, 0.01);
-        stopPlayback(false, false);
-
-        playbackDuration = boundedDuration;
-        playbackPosition = clamp(Number(position) || 0, 0, boundedDuration);
-        playbackMode = "synth";
-
-        if (typeof Tone === "undefined") {
-            throw new Error("Tone.js is not available for synthesized transcription playback.");
-        }
-
-        playbackSynth = new Tone.PolySynth(Tone.Synth, {
-            oscillator: { type: "sine" },
-            envelope: { attack: 0.01, decay: 0.1, sustain: 0.3, release: 1 },
-        }).toDestination();
-
-        const scheduleNow = Tone.now();
-        synthPlaybackClockStartTime = scheduleNow - playbackPosition;
-
-        notes.forEach((note) => {
-            const noteStart = Math.max(0, Number(note.start) || 0);
-            const noteDuration = Math.max(0.01, Number(note.duration) || 0.01);
-            const noteEnd = noteStart + noteDuration;
-            if (noteEnd <= playbackPosition || noteStart > boundedDuration) return;
-
-            const offsetWithinNote = Math.max(0, playbackPosition - noteStart);
-            const remainingDuration = Math.max(
-                0.01,
-                Math.min(noteDuration - offsetWithinNote, boundedDuration - Math.max(noteStart, playbackPosition))
-            );
-            const scheduledTime = scheduleNow + Math.max(0, noteStart - playbackPosition);
-
-            playbackSynth.triggerAttackRelease(
-                Tone.Frequency(note.pitch, "midi"),
-                remainingDuration,
-                scheduledTime,
-                clamp(Number(note.velocity) || 0.8, 0, 1)
-            );
-        });
-
-        playbackState = "playing";
-        updatePlayButton();
-        keepPlaybackPositionInView(playbackPosition, true);
-        renderPianoRollViewport();
-        startPlaybackAnimation();
-    }
-
     function pausePlayback() {
         if (playbackState !== "playing") return;
 
         playbackPosition = getCurrentPlaybackPosition();
-        if (playbackMode === "audio" && audioElement) {
-            audioElement.pause();
-        }
-        disposePlaybackSynth();
+        pauseMediaAudio();
 
         playbackState = "paused";
         playbackMode = "none";
@@ -704,22 +928,13 @@ document.addEventListener("DOMContentLoaded", () => {
     function stopPlayback(resetButton = true, resetPosition = true) {
         cancelPlaybackAnimation();
 
-        if (audioElement) {
-            audioElement.pause();
-            if (resetPosition) {
-                seekSourceAudio(0);
-            }
-        }
-
-        disposePlaybackSynth();
-        if (typeof Tone !== "undefined" && Tone.Transport) {
-            Tone.Transport.stop();
-            Tone.Transport.cancel(0);
+        pauseMediaAudio();
+        if (resetPosition) {
+            seekMediaAudio(0);
         }
 
         playbackState = "stopped";
         playbackMode = "none";
-        synthPlaybackClockStartTime = 0;
         if (resetPosition) {
             playbackPosition = 0;
         }
@@ -730,28 +945,34 @@ document.addEventListener("DOMContentLoaded", () => {
         renderPianoRollViewport();
     }
 
-    function disposePlaybackSynth() {
-        if (!playbackSynth) return;
-
-        try {
-            const releaseTime = typeof Tone !== "undefined" ? Tone.now() : undefined;
-            playbackSynth.releaseAll(releaseTime);
-            playbackSynth.dispose();
-        } finally {
-            playbackSynth = null;
-        }
+    function ensureSourceAudioMetadata() {
+        return ensureAudioElementMetadata(audioElement, "uploaded audio");
     }
 
-    function ensureSourceAudioMetadata() {
-        if (!audioElement) return Promise.reject(new Error("No source audio is available for playback."));
-        if (Number.isFinite(audioElement.duration) || audioElement.readyState >= 1) {
+    function ensureGeneratedAudioMetadata() {
+        return ensureAudioElementMetadata(generatedAudioElement, "generated piano audio");
+    }
+
+    function ensureAvailableAudioMetadata() {
+        const metadataPromises = [];
+        if (hasPlayableSourceAudio()) metadataPromises.push(ensureSourceAudioMetadata());
+        if (hasPlayableGeneratedAudioElement()) metadataPromises.push(ensureGeneratedAudioMetadata());
+        if (metadataPromises.length === 0) {
+            return Promise.reject(new Error("No audio is available for playback."));
+        }
+        return Promise.all(metadataPromises);
+    }
+
+    function ensureAudioElementMetadata(element, label) {
+        if (!element) return Promise.reject(new Error(`No ${label} is available for playback.`));
+        if (Number.isFinite(element.duration) || element.readyState >= 1) {
             return Promise.resolve();
         }
 
         return new Promise((resolve, reject) => {
             const cleanup = () => {
-                audioElement.removeEventListener("loadedmetadata", handleLoaded);
-                audioElement.removeEventListener("error", handleError);
+                element.removeEventListener("loadedmetadata", handleLoaded);
+                element.removeEventListener("error", handleError);
             };
             const handleLoaded = () => {
                 cleanup();
@@ -759,12 +980,12 @@ document.addEventListener("DOMContentLoaded", () => {
             };
             const handleError = () => {
                 cleanup();
-                reject(new Error("Could not load the uploaded audio for playback."));
+                reject(new Error(`Could not load the ${label} for playback.`));
             };
 
-            audioElement.addEventListener("loadedmetadata", handleLoaded);
-            audioElement.addEventListener("error", handleError);
-            audioElement.load();
+            element.addEventListener("loadedmetadata", handleLoaded);
+            element.addEventListener("error", handleError);
+            element.load();
         });
     }
 
@@ -774,18 +995,114 @@ document.addEventListener("DOMContentLoaded", () => {
             : 0;
     }
 
+    function getGeneratedAudioDuration() {
+        return generatedAudioElement && Number.isFinite(generatedAudioElement.duration)
+            ? Math.max(0, generatedAudioElement.duration)
+            : 0;
+    }
+
     function getSourceAudioSeekLimit() {
         return getSourceAudioDuration() || Math.max(playbackDuration || 0, 0.01);
     }
 
+    function getGeneratedAudioSeekLimit() {
+        return getGeneratedAudioDuration() || Math.max(playbackDuration || 0, 0.01);
+    }
+
     function seekSourceAudio(position) {
-        if (!audioElement) return;
+        seekAudioElement(audioElement, position, getSourceAudioSeekLimit());
+    }
+
+    function seekGeneratedAudio(position) {
+        seekAudioElement(generatedAudioElement, position, getGeneratedAudioSeekLimit());
+    }
+
+    function seekMediaAudio(position) {
+        if (hasPlayableSourceAudio()) seekSourceAudio(position);
+        if (hasPlayableGeneratedAudioElement()) seekGeneratedAudio(position);
+    }
+
+    function seekAudioElement(element, position, seekLimit) {
+        if (!element) return;
 
         try {
-            audioElement.currentTime = clamp(Number(position) || 0, 0, getSourceAudioSeekLimit());
+            element.currentTime = clamp(Number(position) || 0, 0, seekLimit);
         } catch (error) {
-            console.debug("Could not seek source audio yet:", error);
+            console.debug("Could not seek audio yet:", error);
         }
+    }
+
+    async function playAvailableMediaAudio(resetVolumes = true) {
+        const mediaElements = getPlayableMediaAudioElements();
+        if (mediaElements.length === 0) return false;
+
+        if (resetVolumes) {
+            setMediaVolumesForActiveSource(false);
+        }
+        const results = await Promise.allSettled(
+            mediaElements.map(({ name, element }) => {
+                if (Math.abs((element.currentTime || 0) - playbackPosition) > AUDIO_SYNC_TOLERANCE_SECS) {
+                    seekAudioElement(
+                        element,
+                        playbackPosition,
+                        name === "generated" ? getGeneratedAudioSeekLimit() : getSourceAudioSeekLimit()
+                    );
+                }
+                return element.play();
+            })
+        );
+
+        const activeIndex = mediaElements.findIndex(({ name }) => name === activeAudioSource);
+        const activeResult = activeIndex >= 0 ? results[activeIndex] : null;
+        const activeStarted = activeResult && activeResult.status === "fulfilled";
+        const fallbackIndex = results.findIndex((result) => result.status === "fulfilled");
+
+        results.forEach((result, index) => {
+            if (result.status === "rejected") {
+                console.warn(`Could not start ${mediaElements[index].name} audio:`, result.reason);
+            }
+        });
+
+        if (!activeStarted && fallbackIndex >= 0) {
+            activeAudioSource = mediaElements[fallbackIndex].name;
+            updateAudioSourceControls("", false);
+            setMediaVolumesForActiveSource(false);
+        }
+
+        return Boolean(activeStarted || fallbackIndex >= 0);
+    }
+
+    function keepMediaAudioInSync(timelinePosition) {
+        if (playbackMode !== "audio" || playbackState !== "playing") return;
+        const now = performance.now();
+        if (now - lastAudioSyncCorrectionTime < AUDIO_SYNC_CHECK_INTERVAL_MS) return;
+
+        const activeElement = getActiveAudioElement();
+        if (!activeElement) return;
+
+        const targetTime = clamp(
+            Number(timelinePosition) || activeElement.currentTime || 0,
+            0,
+            playbackDuration || 0
+        );
+
+        getPlayableMediaAudioElements().forEach(({ name, element }) => {
+            const drift = Math.abs((element.currentTime || 0) - targetTime);
+            if (drift > AUDIO_SYNC_TOLERANCE_SECS) {
+                seekAudioElement(
+                    element,
+                    targetTime,
+                    name === "generated" ? getGeneratedAudioSeekLimit() : getSourceAudioSeekLimit()
+                );
+            }
+            if (element.paused && targetTime < playbackDuration) {
+                element.play().catch((error) => {
+                    console.debug(`Could not resume ${name} audio during sync check:`, error);
+                });
+            }
+        });
+
+        lastAudioSyncCorrectionTime = now;
     }
 
     function resetPlaybackForResults(data) {
@@ -803,6 +1120,7 @@ document.addEventListener("DOMContentLoaded", () => {
             if (playbackState !== "playing") return;
 
             playbackPosition = getCurrentPlaybackPosition();
+            keepMediaAudioInSync(playbackPosition);
             if (playbackPosition >= playbackDuration) {
                 stopPlayback(true);
                 return;
@@ -828,15 +1146,9 @@ document.addEventListener("DOMContentLoaded", () => {
             return clamp(playbackPosition, 0, playbackDuration || 0);
         }
 
-        if (playbackMode === "audio" && audioElement) {
-            return clamp(audioElement.currentTime || 0, 0, playbackDuration || 0);
-        }
-
-        if (playbackMode === "synth") {
-            if (typeof Tone === "undefined") {
-                return clamp(playbackPosition, 0, playbackDuration || 0);
-            }
-            return clamp(Tone.now() - synthPlaybackClockStartTime, 0, playbackDuration || 0);
+        if (playbackMode === "audio") {
+            const activeElement = getActiveAudioElement();
+            return clamp(activeElement ? activeElement.currentTime || 0 : playbackPosition, 0, playbackDuration || 0);
         }
 
         return clamp(playbackPosition, 0, playbackDuration || 0);
@@ -848,9 +1160,9 @@ document.addEventListener("DOMContentLoaded", () => {
         } else if (playbackState === "paused") {
             playBtn.textContent = "Resume";
         } else {
-            playBtn.textContent = hasPlayableSourceAudio()
-                ? "Play Audio + Tracker"
-                : "Play Transcription";
+            playBtn.textContent = hasPlayableMediaAudio()
+                ? "Play Synced Audio + Tracker"
+                : "No Synced Audio Available";
         }
     }
 
@@ -883,18 +1195,22 @@ document.addEventListener("DOMContentLoaded", () => {
         playbackPosition = clamp(Number(targetTime) || 0, 0, playbackDuration);
 
         if (playbackState === "playing") {
-            if (playbackMode === "audio" && audioElement) {
-                seekSourceAudio(playbackPosition);
+            if (playbackMode === "audio" && hasPlayableMediaAudio()) {
+                seekMediaAudio(playbackPosition);
                 keepPlaybackPositionInView(playbackPosition, true);
                 renderPianoRollViewport();
             } else {
-                startSynthPlaybackFrom(playbackPosition, getPlayableNotes(), playbackDuration);
+                startPlaybackFrom(playbackPosition, playbackDuration).catch((error) => {
+                    console.warn("Could not seek synchronized audio playback:", error);
+                    updateStatus(`Playback seek failed: ${error.message}`, "error");
+                    updatePlayButton();
+                });
             }
             return;
         }
 
-        if (audioElement) {
-            seekSourceAudio(playbackPosition);
+        if (hasPlayableMediaAudio()) {
+            seekMediaAudio(playbackPosition);
         }
         keepPlaybackPositionInView(playbackPosition, true);
         updatePlayButton();
@@ -937,17 +1253,40 @@ document.addEventListener("DOMContentLoaded", () => {
 
     function getLastPedalEnd(pedals) {
         return pedals.reduce((lastEnd, pedal) => {
-            const end = (Number(pedal.start) || 0) + Math.max(0, Number(pedal.duration) || 0);
+            const end = getPedalEnd(pedal);
             return Math.max(lastEnd, end);
         }, 0);
     }
 
+    function getPedalStart(pedal) {
+        return Math.max(0, Number(pedal && pedal.start) || 0);
+    }
+
+    function getPedalEnd(pedal) {
+        const start = getPedalStart(pedal);
+        const explicitEnd = Number(pedal && pedal.end);
+        if (Number.isFinite(explicitEnd)) {
+            return Math.max(start, explicitEnd);
+        }
+        return start + Math.max(0, Number(pedal && pedal.duration) || 0);
+    }
+
+    function getPedalDuration(pedal) {
+        return Math.max(0, getPedalEnd(pedal) - getPedalStart(pedal));
+    }
+
+    function isFinitePedalInterval(pedal) {
+        return Number.isFinite(Number(pedal && pedal.start)) &&
+            (Number.isFinite(Number(pedal && pedal.end)) || Number.isFinite(Number(pedal && pedal.duration)));
+    }
+
     function getVisualizationDuration(notes, pedals, duration) {
         const safeNotes = Array.isArray(notes) ? notes.filter(isFiniteNote) : [];
-        const safePedals = Array.isArray(pedals) ? pedals : [];
+        const safePedals = Array.isArray(pedals) ? pedals.filter(isFinitePedalInterval) : [];
         return Math.max(
             Number(duration) || 0,
             getSourceAudioDuration(),
+            getGeneratedAudioDuration(),
             getLastNoteEnd(safeNotes),
             getLastPedalEnd(safePedals),
             1
@@ -979,7 +1318,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         pianoRollState = {
             notes: Array.isArray(notes) ? notes.filter(isFiniteNote) : [],
-            pedals: Array.isArray(pedals) ? pedals : [],
+            pedals: Array.isArray(pedals) ? pedals.filter(isFinitePedalInterval) : [],
             duration: safeDuration,
             minPitch,
             maxPitch,
@@ -1053,15 +1392,14 @@ document.addEventListener("DOMContentLoaded", () => {
         const noteAreaHeight = height - pedalHeight;
         const keyHeight = noteAreaHeight / pitchCount;
 
-        // Clear canvas
-        ctx.fillStyle = "white";
+        // Clear canvas with the dark piano-roll surface.
+        ctx.fillStyle = PIANO_ROLL_THEME.background;
         ctx.fillRect(0, 0, backingWidth, height);
 
         // Draw grid (octave lines and key labels)
-        ctx.strokeStyle = "#eee";
+        ctx.strokeStyle = PIANO_ROLL_THEME.octaveLine;
         ctx.lineWidth = 1;
-        ctx.fillStyle = "#999";
-        ctx.font = "12px sans-serif";
+        ctx.font = "600 12px Inter, sans-serif";
 
         for (let p = minPitch; p <= maxPitch; p++) {
             const y = noteAreaHeight - (p - minPitch) * keyHeight;
@@ -1071,7 +1409,12 @@ document.addEventListener("DOMContentLoaded", () => {
                 ctx.moveTo(0, y);
                 ctx.lineTo(backingWidth, y);
                 ctx.stroke();
-                ctx.fillText(`C${Math.floor(p / 12) - 1}`, 5, clamp(y - 5, 12, noteAreaHeight - 2));
+                drawLabelWithHalo(
+                    `C${Math.floor(p / 12) - 1}`,
+                    5,
+                    clamp(y - 5, 12, noteAreaHeight - 2),
+                    PIANO_ROLL_THEME.text
+                );
             }
         }
 
@@ -1079,72 +1422,103 @@ document.addEventListener("DOMContentLoaded", () => {
 
         drawPedalLane(pedals, startTime, endTime, duration, virtualWidth, scrollLeft, backingWidth, height, pedalHeight);
 
-        // Draw note onsets. The current model predicts onset/velocity only, so
-        // durations are treated as short visual extents unless explicitly marked
-        // as real by the backend.
+        // Draw notes. Durations may still be estimates because the model emits
+        // note onsets/velocities rather than true note-off frames, but the
+        // backend now supplies musically useful estimated extents for display.
         notes.forEach((note) => {
             const noteStart = Number(note.start) || 0;
             const noteDuration = Math.max(0, Number(note.duration) || 0);
             const hasEstimatedDuration = note.duration_estimated === true;
-            const noteEnd = noteStart + (hasEstimatedDuration ? Math.max(0.05, noteDuration) : noteDuration);
-            if (hasEstimatedDuration) {
-                if (noteStart < startTime || noteStart > endTime) return;
-            } else if (noteEnd < startTime || noteStart > endTime) {
+            const noteEnd = noteStart + Math.max(0.05, noteDuration);
+            if (noteEnd < startTime || noteStart > endTime) {
                 return;
             }
             if (note.pitch < minPitch || note.pitch > maxPitch) return;
 
             const y = noteAreaHeight - (note.pitch - minPitch) * keyHeight;
             const x = (noteStart / duration) * virtualWidth - scrollLeft;
-            const w = hasEstimatedDuration
-                ? Math.max(2, Math.min(6, keyHeight * 1.5))
-                : Math.max(1, (noteDuration / duration) * virtualWidth);
+            const w = Math.max(2, (Math.max(0.05, noteDuration) / duration) * virtualWidth);
+            const velocity = clamp(Number(note.velocity) || 0.8, 0, 1);
+            const noteColor = velocityToColor(velocity);
 
-            ctx.fillStyle = `rgba(0, 0, 0, ${clamp(Number(note.velocity) || 0.8, 0, 1) * 0.8 + 0.2})`;
+            const alpha = hasEstimatedDuration
+                ? Math.max(0.32, noteColor.alpha * 0.72)
+                : noteColor.alpha;
+            ctx.fillStyle = `rgba(${noteColor.r}, ${noteColor.g}, ${noteColor.b}, ${alpha})`;
             ctx.fillRect(x, y - keyHeight, w, keyHeight);
+            if (hasEstimatedDuration) {
+                ctx.strokeStyle = `rgba(${noteColor.r}, ${noteColor.g}, ${noteColor.b}, 0.88)`;
+                ctx.lineWidth = 1;
+                ctx.strokeRect(x, y - keyHeight + 0.5, w, Math.max(1, keyHeight - 1));
+                const radius = Math.max(2, Math.min(6, keyHeight * (0.38 + velocity * 0.55)));
+                ctx.beginPath();
+                ctx.fillStyle = `rgba(${noteColor.r}, ${noteColor.g}, ${noteColor.b}, 0.72)`;
+                ctx.arc(x + Math.min(w / 2, radius + 1), y - keyHeight / 2, radius, 0, Math.PI * 2);
+                ctx.fill();
+            }
         });
 
         drawPlaybackIndicator(duration, virtualWidth, scrollLeft, backingWidth, height);
+    }
+
+    function velocityToColor(velocity) {
+        const v = clamp(Number(velocity) || 0, 0, 1);
+        const low = { r: 34, g: 197, b: 94 };    // green: soft
+        const mid = { r: 250, g: 204, b: 21 };   // yellow: medium
+        const high = { r: 248, g: 113, b: 113 }; // red: loud
+        const start = v < 0.5 ? low : mid;
+        const end = v < 0.5 ? mid : high;
+        const amount = v < 0.5 ? v * 2 : (v - 0.5) * 2;
+
+        return {
+            r: Math.round(start.r + (end.r - start.r) * amount),
+            g: Math.round(start.g + (end.g - start.g) * amount),
+            b: Math.round(start.b + (end.b - start.b) * amount),
+            alpha: 0.45 + v * 0.55,
+        };
     }
 
     function drawPedalLane(pedals, startTime, endTime, duration, virtualWidth, scrollLeft, backingWidth, height, pedalHeight) {
         const laneTop = height - pedalHeight;
 
         // Pedal lane background and label
-        ctx.fillStyle = "#eef6ff";
+        ctx.fillStyle = PIANO_ROLL_THEME.pedalLaneBackground;
         ctx.fillRect(0, laneTop, backingWidth, pedalHeight);
-        ctx.fillStyle = "#1e3a8a";
-        ctx.font = "bold 12px sans-serif";
-        ctx.fillText("Sustain pedal", 8, laneTop + 15);
+        ctx.font = "700 12px Inter, sans-serif";
+        drawLabelWithHalo("Sustain pedal", 8, laneTop + 15, PIANO_ROLL_THEME.pedalLaneText);
 
         // Sustain-held intervals
-        ctx.fillStyle = "rgba(37, 99, 235, 0.25)";
+        ctx.fillStyle = PIANO_ROLL_THEME.pedalFill;
         pedals.forEach((pedal) => {
-            const pedalStart = Number(pedal.start) || 0;
-            const pedalDuration = Math.max(0, Number(pedal.duration) || 0);
-            const pedalEnd = pedalStart + pedalDuration;
+            const pedalStart = getPedalStart(pedal);
+            const pedalEnd = getPedalEnd(pedal);
             if (pedalEnd < startTime || pedalStart > endTime) return;
 
-            const x = (pedalStart / duration) * virtualWidth - scrollLeft;
-            const w = Math.max(1, (pedalDuration / duration) * virtualWidth);
+            const visibleStart = Math.max(pedalStart, startTime);
+            const visibleEnd = Math.min(pedalEnd, endTime);
+            const visibleDuration = Math.max(0, visibleEnd - visibleStart);
+            if (visibleDuration <= 0) return;
+
+            const x = (visibleStart / duration) * virtualWidth - scrollLeft;
+            const w = Math.max(1, (visibleDuration / duration) * virtualWidth);
             ctx.fillRect(x, laneTop + 4, w, pedalHeight - 8);
         });
 
-        ctx.strokeStyle = "rgba(37, 99, 235, 0.65)";
+        ctx.strokeStyle = PIANO_ROLL_THEME.pedalBorder;
         ctx.lineWidth = 1;
         ctx.strokeRect(0, laneTop, backingWidth, pedalHeight);
 
-        // Compact onset markers: a small red arrow pointing up from the pedal lane.
+        // Compact onset markers: a green arrow pointing down from the top of the pedal lane.
         pedals.forEach((pedal) => {
-            const pedalStart = Number(pedal.start) || 0;
+            const pedalStart = getPedalStart(pedal);
             if (pedalStart < startTime || pedalStart > endTime) return;
 
             const x = (pedalStart / duration) * virtualWidth - scrollLeft;
             if (x < -4 || x > backingWidth + 4) return;
 
-            const arrowTipY = height - 13;
-            const arrowBaseY = height - 5;
-            ctx.fillStyle = "rgba(220, 38, 38, 0.65)";
+            const arrowTipY = laneTop + 13;
+            const arrowBaseY = laneTop + 5;
+            ctx.fillStyle = PIANO_ROLL_THEME.pedalOnset;
             ctx.beginPath();
             ctx.moveTo(x, arrowTipY);
             ctx.lineTo(x - 4, arrowBaseY);
@@ -1153,23 +1527,19 @@ document.addEventListener("DOMContentLoaded", () => {
             ctx.fill();
         });
 
-        // Compact offset markers: a green arrow pointing down at pedal release.
+        // Compact offset markers: a red arrow pointing up from the bottom of the pedal lane.
         pedals.forEach((pedal) => {
             if (pedal.offset_estimated === true) return;
 
-            const pedalStart = Number(pedal.start) || 0;
-            const pedalDuration = Math.max(0, Number(pedal.duration) || 0);
-            const pedalEnd = Number.isFinite(Number(pedal.end))
-                ? Number(pedal.end)
-                : pedalStart + pedalDuration;
+            const pedalEnd = getPedalEnd(pedal);
             if (pedalEnd < startTime || pedalEnd > endTime) return;
 
             const x = (pedalEnd / duration) * virtualWidth - scrollLeft;
             if (x < -4 || x > backingWidth + 4) return;
 
-            const arrowTipY = laneTop + 13;
-            const arrowBaseY = laneTop + 5;
-            ctx.fillStyle = "rgba(22, 163, 74, 0.75)";
+            const arrowTipY = height - 13;
+            const arrowBaseY = height - 5;
+            ctx.fillStyle = PIANO_ROLL_THEME.pedalOffset;
             ctx.beginPath();
             ctx.moveTo(x, arrowTipY);
             ctx.lineTo(x - 4, arrowBaseY);
@@ -1190,7 +1560,7 @@ document.addEventListener("DOMContentLoaded", () => {
         ctx.strokeStyle = PLAYHEAD_COLOR;
         ctx.fillStyle = PLAYHEAD_COLOR;
         ctx.lineWidth = 2;
-        ctx.shadowColor = "rgba(249, 115, 22, 0.35)";
+        ctx.shadowColor = PIANO_ROLL_THEME.playheadShadow;
         ctx.shadowBlur = playbackState === "playing" ? 8 : 0;
 
         ctx.beginPath();
@@ -1207,12 +1577,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
         ctx.shadowBlur = 0;
         const label = formatPlaybackTime(currentTime);
-        ctx.font = "bold 11px sans-serif";
+        ctx.font = "700 11px Inter, sans-serif";
         const labelWidth = ctx.measureText(label).width + 10;
         const labelX = clamp(x + 6, 2, Math.max(2, backingWidth - labelWidth - 2));
-        ctx.fillStyle = "rgba(249, 115, 22, 0.95)";
+        ctx.fillStyle = PIANO_ROLL_THEME.playheadLabel;
         ctx.fillRect(labelX, 20, labelWidth, 18);
-        ctx.fillStyle = "#fff";
+        ctx.fillStyle = PIANO_ROLL_THEME.playheadText;
         ctx.fillText(label, labelX + 5, 33);
         ctx.restore();
     }
@@ -1230,9 +1600,8 @@ document.addEventListener("DOMContentLoaded", () => {
         const tickStep = pixelsPerSecond >= 80 ? 1 : pixelsPerSecond >= 25 ? 5 : 10;
         const firstTick = Math.floor(startTime / tickStep) * tickStep;
 
-        ctx.strokeStyle = "#f3f4f6";
-        ctx.fillStyle = "#777";
-        ctx.font = "11px sans-serif";
+        ctx.strokeStyle = PIANO_ROLL_THEME.timeLine;
+        ctx.font = "600 11px Inter, sans-serif";
 
         for (let t = firstTick; t <= endTime + tickStep; t += tickStep) {
             if (t < 0) continue;
@@ -1242,8 +1611,20 @@ document.addEventListener("DOMContentLoaded", () => {
             ctx.moveTo(x, 0);
             ctx.lineTo(x, PIANO_ROLL_HEIGHT);
             ctx.stroke();
-            ctx.fillText(`${Math.round(t)}s`, x + 4, 14);
+            drawLabelWithHalo(`${Math.round(t)}s`, x + 4, 14, PIANO_ROLL_THEME.mutedText);
         }
+    }
+
+    function drawLabelWithHalo(text, x, y, color = PIANO_ROLL_THEME.text) {
+        ctx.save();
+        ctx.lineJoin = "round";
+        ctx.miterLimit = 2;
+        ctx.strokeStyle = PIANO_ROLL_THEME.textHalo;
+        ctx.lineWidth = 4;
+        ctx.strokeText(text, x, y);
+        ctx.fillStyle = color;
+        ctx.fillText(text, x, y);
+        ctx.restore();
     }
 
     function clamp(value, min, max) {

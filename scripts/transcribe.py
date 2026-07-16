@@ -18,6 +18,8 @@ from ov_piano.transcription import (  # noqa: E402
     PianoTranscriber,
     TranscriptionConfig,
     TranscriptionResult,
+    estimate_note_intervals,
+    paired_pedal_intervals,
 )
 
 
@@ -99,29 +101,6 @@ def write_json_output(result: TranscriptionResult, transcriber: PianoTranscriber
         f.write("\n")
 
 
-def _paired_pedal_intervals(pedal_events_df, secs_per_frame: float, fallback_end_secs: float | None = None):
-    """Yield paired sustain-pedal intervals from onset/offset event rows."""
-    if pedal_events_df.empty:
-        return
-
-    for pedal_idx, group in pedal_events_df.groupby("pedal_idx"):
-        onsets = sorted(group[group["event_type"] == "onset"]["t_idx"].tolist())
-        offsets = sorted(group[group["event_type"] == "offset"]["t_idx"].tolist())
-        offset_cursor = 0
-        for onset_frame in onsets:
-            while offset_cursor < len(offsets) and offsets[offset_cursor] <= onset_frame:
-                offset_cursor += 1
-            if offset_cursor >= len(offsets):
-                if fallback_end_secs is not None:
-                    start = float(onset_frame * secs_per_frame)
-                    if fallback_end_secs > start:
-                        yield int(pedal_idx), start, fallback_end_secs
-                break
-            offset_frame = offsets[offset_cursor]
-            offset_cursor += 1
-            yield int(pedal_idx), float(onset_frame * secs_per_frame), float(offset_frame * secs_per_frame)
-
-
 def _midi_velocity(value) -> int:
     """Convert a model velocity value to a valid MIDI note-on velocity."""
     try:
@@ -149,22 +128,30 @@ def write_midi_output(result: TranscriptionResult, transcriber: PianoTranscriber
     track.append(mido.MetaMessage("set_tempo", tempo=tempo, time=0))
 
     events = []
-    default_note_duration = 0.4
-    for _, row in result.notes.iterrows():
-        start = float(row["t_idx"] * transcriber.secs_per_frame)
-        end = start + default_note_duration
-        note = int(row["key"] + transcriber.key_beg)
-        velocity = _midi_velocity(row.get("vel", 1.0))
+    for note_row in estimate_note_intervals(
+        result.notes,
+        transcriber.secs_per_frame,
+        key_beg=transcriber.key_beg,
+        total_duration_secs=transcription_duration_secs(result, transcriber),
+    ):
+        start = float(note_row["start"])
+        end = start + float(note_row["duration"])
+        note = int(note_row["pitch"])
+        velocity = _midi_velocity(note_row.get("velocity", 1.0))
         events.append((start, 1, mido.Message("note_on", note=note, velocity=velocity, time=0)))
         events.append((end, 0, mido.Message("note_off", note=note, velocity=0, time=0)))
 
-    for pedal_idx, start, end in _paired_pedal_intervals(
+    for interval in paired_pedal_intervals(
         result.pedal_events,
         transcriber.secs_per_frame,
         fallback_end_secs=transcription_duration_secs(result, transcriber),
+        min_duration_secs=0.0,
     ):
+        pedal_idx = interval["pedal_idx"]
         if pedal_idx != 0:
             continue
+        start = float(interval["start"])
+        end = float(interval["end"])
         events.append((start, 1, mido.Message("control_change", control=64, value=127, time=0)))
         events.append((end, 0, mido.Message("control_change", control=64, value=0, time=0)))
 

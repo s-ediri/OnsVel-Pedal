@@ -3,6 +3,7 @@ import json
 import os
 import wave
 
+import pandas as pd
 import pytest
 import torch
 
@@ -13,6 +14,8 @@ from ov_piano.transcription import (
     _decode_audio_segment_with_pydub,
     _pydub_decode_error_message,
     _source_looks_like_opus,
+    estimate_note_intervals,
+    paired_pedal_intervals,
     normalize_pedal_prediction_shape,
     load_wav_waveform,
     PianoTranscriber,
@@ -76,6 +79,73 @@ def test_transcription_config_rejects_invalid_decoder_values():
         TranscriptionConfig(device="cpu", decoder_gauss_ksize=10).validate()
     with pytest.raises(ValueError, match="pedal_threshold"):
         TranscriptionConfig(device="cpu", pedal_threshold=-0.1).validate()
+    with pytest.raises(ValueError, match="pedal_min_hold_secs"):
+        TranscriptionConfig(device="cpu", pedal_min_hold_secs=-0.1).validate()
+    with pytest.raises(ValueError, match="pedal_smoothing_window"):
+        TranscriptionConfig(device="cpu", pedal_smoothing_window=0).validate()
+    with pytest.raises(ValueError, match="pedal_onset_threshold"):
+        TranscriptionConfig(device="cpu", pedal_onset_threshold=1.1).validate()
+
+
+def test_estimate_note_intervals_marks_estimated_durations_and_caps_repeated_notes():
+    notes_df = pd.DataFrame(
+        [
+            {"batch_idx": 0, "key": 39, "t_idx": 1, "vel": 0.75},
+            {"batch_idx": 0, "key": 39, "t_idx": 4, "vel": 0.5},
+        ]
+    )
+
+    intervals = estimate_note_intervals(
+        notes_df,
+        secs_per_frame=0.1,
+        key_beg=21,
+        fallback_duration_secs=1.0,
+        min_duration_secs=0.05,
+        repeated_note_gap_secs=0.02,
+        total_duration_secs=0.55,
+    )
+
+    assert intervals == [
+        {
+            "pitch": 60,
+            "start": pytest.approx(0.1),
+            "velocity": 0.75,
+            "duration": pytest.approx(0.28),
+            "duration_estimated": True,
+        },
+        {
+            "pitch": 60,
+            "start": pytest.approx(0.4),
+            "velocity": 0.5,
+            "duration": pytest.approx(1.0),
+            "duration_estimated": True,
+        },
+    ]
+
+
+def test_paired_pedal_intervals_caps_unclosed_estimated_hold():
+    events_df = pd.DataFrame(
+        [
+            {"batch_idx": 0, "pedal_idx": 0, "t_idx": 1, "event_type": "onset"},
+        ]
+    )
+
+    intervals = paired_pedal_intervals(
+        events_df,
+        secs_per_frame=1.0,
+        fallback_end_secs=30.0,
+        max_estimated_duration_secs=6.0,
+    )
+
+    assert intervals == [
+        {
+            "pedal_idx": 0,
+            "start": pytest.approx(1.0),
+            "end": pytest.approx(7.0),
+            "duration": pytest.approx(6.0),
+            "offset_estimated": True,
+        }
+    ]
 
 
 def test_load_wav_waveform_reads_stereo_pcm_as_normalized_float_audio():
@@ -355,6 +425,7 @@ def test_run_inference_and_decode_uses_shared_pipeline_with_fake_model():
         decoder_gauss_std=None,
         note_threshold=0.9,
         pedal_threshold=0.5,
+        pedal_min_hold_secs=0.01,
     )
     logmel = torch.randn(1, 4, 6)
 
@@ -377,6 +448,38 @@ def test_run_inference_and_decode_uses_shared_pipeline_with_fake_model():
     assert set(result.pedal_events["event_type"]) == {"onset", "offset"}
     assert list(result.pedal_events["t_idx"]) == [2, 4]
     assert result.logmel.shape == logmel.shape
+
+
+def test_run_inference_and_decode_suppresses_untrained_pedal_branch():
+    config = TranscriptionConfig(
+        device="cpu",
+        target_sr=100,
+        stft_hopsize=10,
+        melbins=4,
+        inference_chunk_size_secs=1.0,
+        inference_chunk_overlap_secs=0.0,
+        decoder_gauss_std=None,
+        note_threshold=0.9,
+        pedal_threshold=0.5,
+    )
+    logmel = torch.randn(1, 4, 6)
+
+    class FakeModel(torch.nn.Module):
+        _onsvel_pedal_branch_loaded = False
+
+        def forward(self, x):
+            frames = x.shape[-1] - 1
+            onsets = torch.full((1, 88, frames), -20.0)
+            velocities = torch.zeros(1, 88, frames)
+            pedals = torch.full((1, 3, frames), -20.0)
+            pedals[0, 1, 1] = 20.0
+            pedals[0, 2, 3] = 20.0
+            return [onsets], velocities, pedals
+
+    result = run_inference_and_decode(FakeModel(), logmel, config)
+
+    assert result.pedal_events.empty
+    assert list(result.pedal_events.columns) == ["batch_idx", "pedal_idx", "t_idx", "event_type"]
 
 
 def test_end_to_end_smoke_generated_wav_fake_model_json_schema(tmp_path):
@@ -408,6 +511,7 @@ def test_end_to_end_smoke_generated_wav_fake_model_json_schema(tmp_path):
         decoder_gauss_std=None,
         note_threshold=0.9,
         pedal_threshold=0.5,
+        pedal_min_hold_secs=0.01,
     )
     transcriber = PianoTranscriber(config)
 
