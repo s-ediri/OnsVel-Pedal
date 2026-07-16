@@ -1,9 +1,10 @@
 """Flask web application for OnV+Pedal piano transcription."""
 from collections import OrderedDict
+import logging
 import math
 import os
 import sys
-from threading import Lock
+from threading import Lock, local
 import time
 import urllib.request
 import uuid
@@ -24,10 +25,13 @@ from ov_piano.transcription import (
     AudioPreprocessingError,
     PianoTranscriber,
     TranscriptionConfig,
+    _configure_pydub_binaries,
     estimate_note_intervals,
     load_audio_waveform,
     paired_pedal_intervals,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 # --- Configuration ---
 # These parameters should match the ones used for training the model.
@@ -53,6 +57,10 @@ class AppConfig:
     GENERATED_AUDIO_BALANCE_MIN_GAIN = 0.03
     GENERATED_AUDIO_BALANCE_MAX_GAIN = 12.0
     GENERATED_AUDIO_BALANCE_PEAK_HEADROOM = 0.98
+    GENERATED_AUDIO_SYNTHETIC_FALLBACK = os.environ.get(
+        "ONSVEL_GENERATED_AUDIO_SYNTHETIC_FALLBACK",
+        "1",
+    ).lower() not in {"0", "false", "no"}
     GRAND_PIANO_SAMPLE_DIR = os.path.join(STATIC_ASSETS_DIR, "grand_piano_samples", "salamander")
     GRAND_PIANO_SAMPLE_BASE_URL = os.environ.get(
         "ONSVEL_GRAND_PIANO_SAMPLE_BASE_URL",
@@ -115,6 +123,8 @@ _GRAND_PIANO_SAMPLE_FILES = OrderedDict([
     (108, "C8.mp3"),
 ])
 _grand_piano_sample_cache = {}
+_missing_grand_piano_sample_warnings = set()
+_generated_audio_render_state = local()
 
 # --- Flask Routes ---
 @app.route("/")
@@ -277,6 +287,7 @@ def _generate_piano_audio_artifact(notes, pedals, duration_secs, reference_audio
     sample_rate = _generated_audio_sample_rate()
     renderable_notes = [note for note in notes if _is_renderable_note(note)]
     render_duration = _generated_audio_duration(renderable_notes, pedals, duration_secs)
+    _generated_audio_render_state.synthetic_fallback_used = False
 
     try:
         os.makedirs(CONF.GENERATED_AUDIO_DIR, exist_ok=True)
@@ -293,13 +304,14 @@ def _generate_piano_audio_artifact(notes, pedals, duration_secs, reference_audio
             reference_audio_balance,
         )
         _write_mono_pcm_wav(path, samples, sample_rate)
+        engine = _generated_audio_engine_name()
     except Exception as exc:
         print(f"Generated piano audio rendering failed: {exc}")
         return {
             "url": None,
             "sample_rate": sample_rate,
             "duration": render_duration,
-            "engine": "server-sampled-grand-piano-salamander-v1",
+            "engine": _generated_audio_engine_name(),
             "latency_seconds": 0.0,
             "balance": {"applied": False, "reason": "render_failed"},
             "error": f"Generated grand piano audio could not be rendered: {exc}",
@@ -309,10 +321,17 @@ def _generate_piano_audio_artifact(notes, pedals, duration_secs, reference_audio
         "url": f"/api/generated-audio/{filename}",
         "sample_rate": sample_rate,
         "duration": render_duration,
-        "engine": "server-sampled-grand-piano-salamander-v1",
+        "engine": engine,
         "latency_seconds": 0.0,
         "balance": balance_info,
     }
+
+
+def _generated_audio_engine_name():
+    """Return the renderer identifier for the current generated-audio request."""
+    if getattr(_generated_audio_render_state, "synthetic_fallback_used", False):
+        return "server-synthetic-piano-fallback-v1"
+    return "server-sampled-grand-piano-salamander-v1"
 
 
 def _analyze_reference_audio_balance(audio_source):
@@ -637,27 +656,134 @@ def _load_grand_piano_sample(sample_pitch, sample_rate):
     if not filename:
         raise RuntimeError(f"No grand piano sample is configured for MIDI pitch {sample_pitch}.")
 
-    path = _ensure_grand_piano_sample_file(filename)
+    fallback_cache_key = ("synthetic-grand-piano", int(sample_pitch), int(sample_rate))
+    fallback_cached = _grand_piano_sample_cache.get(fallback_cache_key)
+    if fallback_cached is not None and not _local_grand_piano_sample_available(filename):
+        _mark_generated_audio_synthetic_fallback_used()
+        return fallback_cached
+
     try:
-        mtime_ns = os.stat(path).st_mtime_ns
+        path = _ensure_grand_piano_sample_file(filename)
+        try:
+            mtime_ns = os.stat(path).st_mtime_ns
+        except OSError:
+            mtime_ns = None
+        cache_key = (os.path.abspath(path), mtime_ns, int(sample_rate))
+        cached = _grand_piano_sample_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        samples, source_rate = _decode_audio_file_to_mono(path)
+        samples = _trim_leading_silence(samples)
+        if source_rate != sample_rate:
+            samples = _resample_audio(samples, source_rate, sample_rate)
+        peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+        if peak > 0.0:
+            samples = (samples / peak).astype(np.float32)
+        if samples.size == 0:
+            raise RuntimeError(f"Grand piano sample is empty: {path}")
+
+        _grand_piano_sample_cache[cache_key] = samples
+        return samples
+    except Exception as exc:
+        if not _generated_audio_synthetic_fallback_enabled():
+            raise
+        return _fallback_grand_piano_sample(sample_pitch, sample_rate, filename, exc)
+
+
+def _generated_audio_synthetic_fallback_enabled():
+    """Return True when missing Salamander samples may use a local synth fallback."""
+    value = getattr(CONF, "GENERATED_AUDIO_SYNTHETIC_FALLBACK", True)
+    if isinstance(value, str):
+        return value.lower() not in {"0", "false", "no"}
+    return bool(value)
+
+
+def _local_grand_piano_sample_available(filename):
+    """Return True when a non-empty local Salamander sample file exists."""
+    if not _is_plain_checkpoint_name(filename):
+        return False
+    sample_dir = os.path.abspath(CONF.GRAND_PIANO_SAMPLE_DIR)
+    path = os.path.abspath(os.path.join(sample_dir, filename))
+    if not _is_path_within_directory(path, sample_dir):
+        return False
+    try:
+        return os.path.isfile(path) and os.path.getsize(path) > 0
     except OSError:
-        mtime_ns = None
-    cache_key = (os.path.abspath(path), mtime_ns, int(sample_rate))
+        return False
+
+
+def _fallback_grand_piano_sample(sample_pitch, sample_rate, filename, exc):
+    """Return a cached synthetic fallback sample when recorded samples are unavailable."""
+    _mark_generated_audio_synthetic_fallback_used()
+    _warn_about_grand_piano_sample_fallback_once(filename, exc)
+
+    cache_key = ("synthetic-grand-piano", int(sample_pitch), int(sample_rate))
     cached = _grand_piano_sample_cache.get(cache_key)
     if cached is not None:
         return cached
 
-    samples, source_rate = _decode_audio_file_to_mono(path)
-    samples = _trim_leading_silence(samples)
-    if source_rate != sample_rate:
-        samples = _resample_audio(samples, source_rate, sample_rate)
+    samples = _synthesize_grand_piano_sample(sample_pitch, sample_rate)
+    _grand_piano_sample_cache[cache_key] = samples
+    return samples
+
+
+def _mark_generated_audio_synthetic_fallback_used():
+    _generated_audio_render_state.synthetic_fallback_used = True
+
+
+def _warn_about_grand_piano_sample_fallback_once(filename, exc):
+    warning_key = filename
+    if warning_key in _missing_grand_piano_sample_warnings:
+        return
+    _missing_grand_piano_sample_warnings.add(warning_key)
+    sample_dir = os.path.abspath(CONF.GRAND_PIANO_SAMPLE_DIR)
+    message = (
+        f"Grand piano sample {filename} could not be loaded ({exc}); "
+        "using the built-in synthetic piano fallback for generated playback. "
+        f"For recorded Salamander piano audio, place samples in {sample_dir} "
+        "or allow the configured sample download."
+    )
+    LOGGER.warning(message)
+
+
+def _synthesize_grand_piano_sample(sample_pitch, sample_rate):
+    """Generate a deterministic piano-like mono sample for offline fallback rendering."""
+    safe_sample_rate = max(8_000, int(sample_rate))
+    pitch = int(round(_clamp(_safe_float(sample_pitch, 60.0), 21.0, 108.0)))
+    frequency = 440.0 * (2.0 ** ((pitch - 69.0) / 12.0))
+    duration_secs = _clamp(5.0 - 0.03 * (pitch - 48), 2.2, 6.0)
+    num_samples = max(1, int(round(duration_secs * safe_sample_rate)))
+    t = np.arange(num_samples, dtype=np.float32) / float(safe_sample_rate)
+
+    nyquist = 0.47 * safe_sample_rate
+    tone = np.zeros(num_samples, dtype=np.float32)
+    harmonics = (
+        (1.0, 1.00, 0.00),
+        (2.0, 0.42, 0.23),
+        (3.0, 0.24, 0.41),
+        (4.0, 0.13, 0.60),
+        (5.0, 0.08, 0.79),
+    )
+    for multiple, amplitude, phase in harmonics:
+        partial_frequency = frequency * multiple
+        if partial_frequency < nyquist:
+            tone += amplitude * np.sin((2.0 * math.pi * partial_frequency * t) + phase).astype(np.float32)
+
+    detuned_frequency = frequency * 1.006
+    if detuned_frequency < nyquist:
+        tone += 0.12 * np.sin(2.0 * math.pi * detuned_frequency * t).astype(np.float32)
+
+    attack = 1.0 - np.exp(-t / 0.006)
+    decay_time = _clamp(3.4 - 0.028 * (pitch - 60), 0.9, 5.2)
+    body_envelope = attack * np.exp(-t / decay_time)
+    hammer_frequency = min(nyquist, max(frequency * 8.0, 1_200.0))
+    hammer = 0.035 * np.sin(2.0 * math.pi * hammer_frequency * t) * np.exp(-t / 0.012)
+
+    samples = ((tone * body_envelope) + hammer).astype(np.float32)
     peak = float(np.max(np.abs(samples))) if samples.size else 0.0
     if peak > 0.0:
         samples = (samples / peak).astype(np.float32)
-    if samples.size == 0:
-        raise RuntimeError(f"Grand piano sample is empty: {path}")
-
-    _grand_piano_sample_cache[cache_key] = samples
     return samples
 
 
@@ -712,6 +838,7 @@ def _decode_audio_file_to_mono(path):
         raise RuntimeError("pydub is required to decode grand piano sample files.") from exc
 
     try:
+        _configure_pydub_binaries(AudioSegment)
         audio = AudioSegment.from_file(path).set_channels(1)
     except Exception as exc:
         raise RuntimeError(f"Could not decode grand piano sample {path}: {exc}") from exc

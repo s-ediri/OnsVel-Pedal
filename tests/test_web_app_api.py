@@ -16,6 +16,7 @@ from web_app import app as web_app
 def clear_model_cache(tmp_path, monkeypatch):
     web_app._model_cache.clear()
     web_app._grand_piano_sample_cache.clear()
+    web_app._missing_grand_piano_sample_warnings.clear()
     monkeypatch.setattr(web_app.CONF, "GENERATED_AUDIO_DIR", str(tmp_path / "generated_audio"))
     grand_piano_sample = torch.linspace(0, 0.8, steps=4096).numpy().astype("float32")
     monkeypatch.setattr(
@@ -26,6 +27,7 @@ def clear_model_cache(tmp_path, monkeypatch):
     yield
     web_app._model_cache.clear()
     web_app._grand_piano_sample_cache.clear()
+    web_app._missing_grand_piano_sample_warnings.clear()
 
 
 @pytest.fixture
@@ -435,6 +437,34 @@ def test_generate_piano_audio_artifact_writes_zero_latency_wav(tmp_path, monkeyp
         assert wav_file.getnframes() == pytest.approx(generated_audio["duration"] * 8_000, abs=1)
         frames = wav_file.readframes(wav_file.getnframes())
     assert any(byte != 0 for byte in frames)
+
+
+def test_load_grand_piano_sample_uses_synthetic_fallback_when_sample_missing(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(web_app.CONF, "GRAND_PIANO_SAMPLE_DIR", str(tmp_path / "missing_samples"))
+    monkeypatch.setattr(web_app.CONF, "GRAND_PIANO_SAMPLE_BASE_URL", "")
+    monkeypatch.setattr(web_app.CONF, "GENERATED_AUDIO_SYNTHETIC_FALLBACK", True)
+    web_app._grand_piano_sample_cache.clear()
+    web_app._missing_grand_piano_sample_warnings.clear()
+    web_app._generated_audio_render_state.synthetic_fallback_used = False
+    caplog.set_level("WARNING", logger="web_app.app")
+
+    sample = web_app._load_grand_piano_sample(96, 8_000)
+
+    assert sample.dtype == np.float32
+    assert sample.size > 8_000
+    assert float(np.max(np.abs(sample))) == pytest.approx(1.0)
+    assert web_app._generated_audio_engine_name() == "server-synthetic-piano-fallback-v1"
+    assert "Grand piano sample C7.mp3 could not be loaded" in caplog.text
+
+
+def test_load_grand_piano_sample_raises_when_synthetic_fallback_disabled(tmp_path, monkeypatch):
+    monkeypatch.setattr(web_app.CONF, "GRAND_PIANO_SAMPLE_DIR", str(tmp_path / "missing_samples"))
+    monkeypatch.setattr(web_app.CONF, "GRAND_PIANO_SAMPLE_BASE_URL", "")
+    monkeypatch.setattr(web_app.CONF, "GENERATED_AUDIO_SYNTHETIC_FALLBACK", False)
+    web_app._grand_piano_sample_cache.clear()
+
+    with pytest.raises(RuntimeError, match="Grand piano sample C7.mp3 is missing"):
+        web_app._load_grand_piano_sample(96, 8_000)
 
 
 def test_analyze_reference_audio_balance_measures_wav_and_rewinds():

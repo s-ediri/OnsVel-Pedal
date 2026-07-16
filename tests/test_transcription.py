@@ -10,9 +10,12 @@ import torch
 from ov_piano.transcription import (
     AudioPreprocessingError,
     TranscriptionConfig,
+    _audio_tool_resolution_cache,
+    _audio_tool_warning_cache,
     _configure_pydub_binaries,
     _decode_audio_segment_with_pydub,
     _pydub_decode_error_message,
+    _resolve_audio_tool_path,
     _source_looks_like_opus,
     estimate_note_intervals,
     paired_pedal_intervals,
@@ -244,6 +247,33 @@ def test_configure_pydub_binaries_skips_broken_path_candidate(monkeypatch, tmp_p
 
     assert resolved_ffmpeg == str(working)
     assert FakeAudioSegment.converter == str(working)
+
+
+def test_resolve_audio_tool_path_caches_unusable_candidate_warning(monkeypatch, tmp_path, caplog):
+    broken = tmp_path / "ffmpeg.exe"
+    broken.write_text("", encoding="utf-8")
+    _audio_tool_resolution_cache.clear()
+    _audio_tool_warning_cache.clear()
+    monkeypatch.setattr(
+        "ov_piano.transcription._candidate_audio_tool_paths",
+        lambda executable_name: [(str(broken), "PATH")],
+    )
+    monkeypatch.setattr("ov_piano.transcription._audio_tool_is_runnable", lambda path: False)
+    caplog.set_level("WARNING", logger="ov_piano.transcription")
+
+    assert _resolve_audio_tool_path("ffmpeg") is None
+    assert _resolve_audio_tool_path("ffmpeg") is None
+
+    warning_messages = [
+        record.message
+        for record in caplog.records
+        if "Ignoring PATH candidate for ffmpeg" in record.message
+    ]
+    assert warning_messages == [
+        f"Ignoring PATH candidate for ffmpeg because it did not start successfully: {broken}"
+    ]
+    _audio_tool_resolution_cache.clear()
+    _audio_tool_warning_cache.clear()
 
 
 def test_source_looks_like_opus_uses_extension_mime_and_signature():

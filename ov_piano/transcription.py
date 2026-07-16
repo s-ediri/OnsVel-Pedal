@@ -43,6 +43,8 @@ ModelFactory = Callable[..., torch.nn.Module]
 LOGGER = logging.getLogger(__name__)
 OPUS_SIGNATURE_SCAN_BYTES = 64 * 1024
 WINDOWS_DLL_LOAD_FAILURE_CODES = ("3221225781", "-1073741515", "0xc0000135")
+_audio_tool_resolution_cache = {}
+_audio_tool_warning_cache = set()
 PEDAL_BRANCH_KEY_PREFIXES = (
     "pedal_stage.",
     "pedal_state_head.",
@@ -651,6 +653,33 @@ def _candidate_audio_tool_paths(executable_name: str):
     return candidates
 
 
+def _audio_tool_resolution_cache_key(executable_name: str):
+    """Return a cache key that changes when relevant executable settings change."""
+    env_values = tuple(
+        (env_var, os.environ.get(env_var, ""))
+        for env_var in _audio_tool_env_vars(executable_name)
+    )
+    return (executable_name, os.name, env_values, os.environ.get("PATH", ""))
+
+
+def _warn_about_unusable_audio_tool_once(source: str, executable_name: str, candidate: str) -> None:
+    """Log a broken ffmpeg/ffprobe candidate once per process to avoid noisy output."""
+    warning_key = (
+        source,
+        executable_name,
+        os.path.normcase(os.path.abspath(candidate)),
+    )
+    if warning_key in _audio_tool_warning_cache:
+        return
+    _audio_tool_warning_cache.add(warning_key)
+    LOGGER.warning(
+        "Ignoring %s candidate for %s because it did not start successfully: %s",
+        source,
+        executable_name,
+        candidate,
+    )
+
+
 def _audio_tool_is_runnable(candidate: str) -> bool:
     """Return True when an ffmpeg/ffprobe executable can start successfully."""
     try:
@@ -678,17 +707,19 @@ def _resolve_audio_tool_path(executable_name: str) -> Optional[str]:
     Each candidate is also started with ``-version`` so broken Conda/IDE PATH
     entries that fail with ``STATUS_DLL_NOT_FOUND`` are skipped automatically.
     """
+    cache_key = _audio_tool_resolution_cache_key(executable_name)
+    if cache_key in _audio_tool_resolution_cache:
+        return _audio_tool_resolution_cache[cache_key]
+
+    resolved_path = None
     for candidate, source in _candidate_audio_tool_paths(executable_name):
         if _audio_tool_is_runnable(candidate):
-            return candidate
-        LOGGER.warning(
-            "Ignoring %s candidate for %s because it did not start successfully: %s",
-            source,
-            executable_name,
-            candidate,
-        )
+            resolved_path = candidate
+            break
+        _warn_about_unusable_audio_tool_once(source, executable_name, candidate)
 
-    return None
+    _audio_tool_resolution_cache[cache_key] = resolved_path
+    return resolved_path
 
 
 def _configure_pydub_binaries(AudioSegment) -> Tuple[Optional[str], Optional[str]]:
