@@ -189,8 +189,8 @@ class ConfDef:
         "OnsetsAndVelocities_2023_03_04_09_53_53.289step=43500_f1=0.9675__0.9480.torch",
     )
     RESUME_FROM_LATEST: bool = False
-    # data loader - optimized for 16GB RAM system with RTX 2070 SUPER (8GB VRAM)
-    # PRODUCTION SETTINGS: Optimized for 3-5 day training with proper context
+    # data loader settings tested on the local 16GB RAM / RTX 2070 SUPER setup
+    # Use longer chunks so the pedal head sees enough musical context.
     TRAIN_BS: int = 1  # Longer pedal context needs a smaller physical batch
     TRAIN_BATCH_SECS: float = (
         12.0  # Longer context helps phrase-level sustain-pedal decisions

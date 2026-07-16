@@ -1,23 +1,33 @@
-# Quick Start: Running Pedal-Aware Evaluation
+# Quick Start: Pedal-Aware Evaluation
+
+This guide explains how to run the maintained evaluation scripts for a trained pedal-aware checkpoint.
 
 ## Prerequisites
-- Conda or Miniconda available on Windows
-- Conda environment `onsvel` created from the repository root `environment.yml`
-- Trained model checkpoint in `out/model_snapshots/`, or a documented release/download checkpoint copied there
-- Datasets in `datasets/` directory
 
-> **Checkpoint policy:** `.torch` checkpoints are generated binary artifacts and are ignored by Git. Do not commit new checkpoints or move them to Git LFS for normal development. Share selected models as versioned release/download artifacts and document the URL, filename, expected local path, and checksum/metric metadata.
+- Conda or Miniconda on Windows
+- The `onsvel` environment created from `environment.yml`
+- MAESTRO/MAPS data prepared under `datasets/`
+- A checkpoint copied to `out/model_snapshots/`
 
-## Step 1: Create and Validate Environment
+`.torch` checkpoints are local binary artifacts and are ignored by Git. If a selected model needs to be shared, keep it as a separate release/download artifact and record the filename, expected local path, metric summary, and checksum if available.
+
+## Step 1: create or refresh the environment
+
 ```bash
 conda env create -f environment.yml
 conda activate onsvel
 python -m pytest tests -q
 ```
 
-If the environment already exists, use `conda env update -f environment.yml --prune` instead of `conda env create -f environment.yml`.
+If the environment already exists:
 
-For a clean reproducible reset, especially if you previously installed packages with pip inside `onsvel`, remove and recreate the environment:
+```bash
+conda env update -f environment.yml --prune
+conda activate onsvel
+python -m pytest tests -q
+```
+
+For a clean reset after local pip experiments:
 
 ```bash
 conda env remove -n onsvel
@@ -26,49 +36,35 @@ conda activate onsvel
 python -m pytest tests -q
 ```
 
-Run the commands above from the repository root. `environment.yml` installs the project in editable mode (`-e .`) after the pinned Conda packages are present, so direct commands such as `python scripts/03_evaluate_pedal_model.py` can import `ov_piano`. If you only need to refresh that editable install later, run `python -m pip install --no-deps --no-build-isolation -e .` after activating `onsvel`. Avoid ad-hoc `pip install --upgrade ...` commands inside `onsvel`; use the clean reset commands above to return to the pinned environment.
+`environment.yml` installs this project in editable mode, so commands such as `python scripts/03_evaluate_pedal_model.py` can import `ov_piano` from the repository root.
 
-## Step 2: Run Evaluation
+## Step 2: choose an evaluation preset
 
-Evaluation now has named presets so diagnostic runs are not confused with final metrics:
-
-| Preset | Purpose | Validation split | Report as final? |
-|--------|---------|------------------|------------------|
-| `quick` | Smoke test that the checkpoint, data paths, and pedal metrics work | Highly shortened (`XV_TAKE_ONE_EVERY=50`) | **No** |
-| `low_memory` | Default memory-safe run for 8GB-class GPUs | Shortened (`XV_TAKE_ONE_EVERY=20`) | **No** |
-| `full` | Final benchmark/reporting run | Full validation split (`XV_TAKE_ONE_EVERY=1`) | **Yes** |
+| Preset | Purpose | Validation split | Use for final report? |
+|--------|---------|------------------|-----------------------|
+| `quick` | Smoke test for checkpoint and data paths | Highly shortened (`XV_TAKE_ONE_EVERY=50`) | No |
+| `low_memory` | Safer run for limited GPU memory | Shortened (`XV_TAKE_ONE_EVERY=20`) | No |
+| `full` | Final benchmark run | Full validation split (`XV_TAKE_ONE_EVERY=1`) | Yes |
 
 ```bash
-# Fast smoke test only. Do not report these metrics as final.
+# Fast smoke test only
 python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=quick
 
-# Memory-safe diagnostic/default run. Do not report these metrics as final.
+# Memory-safer diagnostic run
 python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=low_memory
 
-# Final/reportable metrics: uses the full validation split for threshold search.
+# Final metrics using the full validation split
 python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=full
 
-# Or specify a specific checkpoint:
+# Final metrics for a specific checkpoint
 python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=full SNAPSHOT_INPATH="out/model_snapshots/YOUR_MODEL.torch"
 ```
 
-> **Important:** `quick` and `low_memory` still evaluate the test split, but their thresholds are selected from a shortened validation split. Treat those results as diagnostic only. Rerun with `EVALUATION_PRESET=full` before publishing or comparing final metrics.
+The `quick` and `low_memory` presets still run test evaluation, but their thresholds are selected from shortened validation splits. Use `EVALUATION_PRESET=full` before reporting final metrics.
 
-### Resuming Interrupted Evaluation
+## Resuming interrupted evaluation
 
-Evaluation checkpoints are enabled by default. The scripts save resumable stage
-checkpoints under `out/eval_checkpoints/` after each successfully processed file
-or completed grid-search combination:
-
-- `03_evaluate_pedal_model.py` checkpoints validation inference, note grid search,
-  pedal grid search, and final test metrics.
-- `04_evaluate_test_split.py` checkpoints test inference and test grid summaries.
-
-If a run is interrupted, rerun the same command and matching checkpoints will be
-loaded automatically. Checkpoints are fingerprinted from the model snapshot, data
-paths, split/file list, decoder settings, thresholds, and tolerance settings, so
-changing evaluation-relevant options creates a separate checkpoint file instead
-of mixing stale results.
+Evaluation resume files are stored under `out/eval_checkpoints/`. They are fingerprinted from the checkpoint, data paths, split list, decoder settings, thresholds, and tolerance settings.
 
 Useful overrides:
 
@@ -76,18 +72,20 @@ Useful overrides:
 # Disable evaluation resume/checkpointing for one run
 python scripts/03_evaluate_pedal_model.py EVALUATION_CHECKPOINTS_ENABLED=false
 
-# Force recomputation for the current command/fingerprint
+# Recompute the current command/fingerprint
 python scripts/03_evaluate_pedal_model.py RESET_EVALUATION_CHECKPOINTS=true
 
 # Store checkpoint files somewhere else
 python scripts/03_evaluate_pedal_model.py EVALUATION_CHECKPOINT_DIR="out/eval_checkpoints_full_run"
 ```
 
-## Step 3: Check Results
-Results will be printed to console and saved to `out/txt_logs/`
+## Step 3: check the output
 
-Expected output format:
-```
+Results are printed to the console and written to `out/txt_logs/`.
+
+Expected format:
+
+```text
 XV HYPERPARAMETER SEARCH:
 Summary (without velocity):
    threshold   shift      P      R      F1
@@ -100,142 +98,102 @@ ONSETS:
 2004/...                0.xxx  0.xxx  0.xxx
 ...
 AVERAGES (t=0.74, s=-0.01)  0.xxx  0.xxx  0.xxx
-
-ONSETS+VELOCITIES:
-[Similar format]
 ```
 
 ## Troubleshooting
 
-### Error: "ModuleNotFoundError: No module named 'omegaconf'"
-**Solution:** Make sure you activated the correct conda environment:
+### `ModuleNotFoundError: No module named 'omegaconf'`
+
+Activate the project environment:
+
 ```bash
 conda activate onsvel
 ```
 
-### Error: "No module named 'pyaudioop'" when reading audio
-**Cause:** You are likely running the app or CLI with Python 3.13+ outside the supported `onsvel` Conda environment. Python 3.13 removed the stdlib `audioop` module that `pydub` expects.
+### `No module named 'pyaudioop'` when reading audio
 
-**Preferred solution:** Use the project environment:
+This usually means the app or CLI is running on Python 3.13+ outside the supported Conda environment. Use:
+
 ```bash
 conda activate onsvel
 ```
 
-**Pip-only workaround:** Install the compatibility package, then make sure `ffmpeg` is also installed and available on `PATH` for MP3/non-WAV decoding:
+For pip-only setups, install the compatibility package and make sure `ffmpeg` is available on `PATH`:
+
 ```bash
 python -m pip install audioop-lts
 ```
 
-### Error: "ValueError: too many values to unpack"
-**Solution:** This was the main issue - FIXED in [03_evaluate_pedal_model.py](03_evaluate_pedal_model.py:218)
+### `ValueError: too many values to unpack`
 
-### Error: "FileNotFoundError" for model checkpoint
-**Solution:** Check that your model file exists:
+Use the current evaluation script. The pedal-aware model returns onset, velocity, and pedal outputs, so older two-output evaluation code will fail.
+
+### `FileNotFoundError` for a checkpoint
+
+Check that the checkpoint exists:
+
 ```bash
 ls out/model_snapshots/
 ```
 
-### Out of Memory (OOM)
-**Solution:** Start from the `low_memory` preset, then reduce chunk size if needed:
+On Windows cmd:
+
+```cmd
+dir out\model_snapshots
+```
+
+### Out of memory
+
+Start with the lower-memory preset, then reduce chunk size if required:
+
 ```bash
 python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=low_memory INFERENCE_CHUNK_SIZE=30.0
 ```
 
-## Configuration Options
-
-You can override any configuration parameter via command line:
+## Common overrides
 
 ```bash
-# Select a named preset
-python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=quick
-python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=low_memory
-python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=full
-
-# Use smaller chunks (for limited memory)
+# Smaller chunks for limited memory
 python scripts/03_evaluate_pedal_model.py INFERENCE_CHUNK_SIZE=100
 
-# Test fewer thresholds (faster evaluation)
+# Fewer thresholds for a faster diagnostic run
 python scripts/03_evaluate_pedal_model.py SEARCH_THRESHOLDS="[0.7, 0.75, 0.8]"
 
-# Use CPU instead of GPU
+# CPU evaluation
 python scripts/03_evaluate_pedal_model.py DEVICE="cpu"
 
-# Process only every Nth validation file (faster)
+# Process every Nth validation file only; not final/reportable
 python scripts/03_evaluate_pedal_model.py XV_TAKE_ONE_EVERY=10
 ```
 
-If `XV_TAKE_ONE_EVERY` is not `1`, the validation search is shortened and the script will warn that the resulting validation-selected thresholds and test metrics are not final/reportable.
+If `XV_TAKE_ONE_EVERY` is not `1`, the validation search is shortened and the script will warn that the metrics are diagnostic only.
 
-## Alternative Evaluation Scripts
+## Maintained evaluation scripts
 
-### 1. Memory-Efficient Evaluation
 ```bash
-python simple_eval.py
-```
-- Uses smaller chunks (60s)
-- Fewer threshold tests
-- Better for systems with limited memory
+# Main pedal-aware evaluation
+python scripts/03_evaluate_pedal_model.py EVALUATION_PRESET=full
 
-### 2. Pedal-Specific Evaluation
+# Test-split evaluation helper
+python scripts/04_evaluate_test_split.py
+```
+
+## Reading the metrics
+
+- Precision: the proportion of predicted notes/events that are correct.
+- Recall: the proportion of ground-truth notes/events that were detected.
+- F1 score: harmonic mean of precision and recall.
+- Threshold: probability cutoff used by the decoder.
+- Shift: small timing offset applied when matching predictions to ground truth.
+
+For final reporting, use the full preset so thresholds are selected using the full validation split.
+
+## After evaluation
+
 ```bash
-python eval_with_pedals.py
-```
-- Evaluates sustain pedal detection
-- Reports pedal onset/offset metrics
-- Includes onset/velocity evaluation
-
-## Understanding the Results
-
-### Precision (P)
-- Percentage of predicted notes that are correct
-- Higher is better (fewer false alarms)
-
-### Recall (R)
-- Percentage of actual notes that were detected
-- Higher is better (fewer missed notes)
-
-### F1 Score
-- Harmonic mean of Precision and Recall
-- Balanced measure of overall performance
-- **This is the primary metric to optimize**
-
-### Threshold (t)
-- Probability threshold for onset detection
-- Lower threshold → more detections (higher recall, lower precision)
-- Higher threshold → fewer detections (higher precision, lower recall)
-- Optimal threshold found via cross-validation. Use `EVALUATION_PRESET=full` when the threshold will be used for final metrics.
-
-### Shift (s)
-- Time offset applied to predictions (in seconds)
-- Accounts for systematic timing bias in the model
-- Typically small (-0.01 to 0.01 seconds)
-
-## Expected Performance
-
-Based on the original paper (without pedal):
-- **Onsets F1:** ~0.967 (96.7%)
-- **Onsets+Velocities F1:** ~0.945 (94.5%)
-
-Your model (with pedal support) may have slightly different metrics depending on training configuration.
-
-## Next Steps After Evaluation
-
-1. **Analyze training logs:**
-   ```bash
+# Analyze training logs
 python scripts/05_analyze_training_logs.py LOG_PATH="out/txt_logs/YOUR_LOG.json"
-   ```
 
-2. **Generate visualization plots:**
-   ```bash
+# Generate a qualitative plot
 python scripts/06_visualize_pedal_predictions.py SNAPSHOT_INPATH="out/model_snapshots/YOUR_MODEL.torch"
-   ```
-
-3. **Continue training:**
-   ```bash
-   python scripts/02_train_pedal_model.py
-   # Will auto-resume from latest checkpoint
-   ```
-
----
-
-**All fixes have been applied. Evaluation should now run without errors.** ✅
+```

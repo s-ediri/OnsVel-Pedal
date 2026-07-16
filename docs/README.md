@@ -1,16 +1,16 @@
 # OnV+Pedal: Pedal-Aware Piano Onset, Velocity, and Sustain Pedal Prediction
 
-This repository contains a pedal-focused adaptation of a piano transcription pipeline for predicting onsets, velocities, and sustain pedal events from audio. It builds on the original onset/velocity training framework from the iamusica_training project, but it has been substantially reworked and extended to make sustain-pedal prediction a first-class objective.
+This repository contains a pedal-focused adaptation of a piano transcription pipeline for predicting onsets, velocities, and sustain-pedal events from audio. It builds on the original onset/velocity training framework from the iamusica_training project, with additional data handling, model output, training, evaluation, and interface work for sustain-pedal prediction.
 
-The project is designed to:
+The project includes scripts to:
 * install the required software dependencies
 * download and preprocess the required datasets
 * train and evaluate models for onset, velocity, and pedal prediction
 * analyze checkpoints and generate qualitative visualizations
 
-This repository is intentionally differentiated by its focus on sustain-pedal detection, which is treated as a core prediction target rather than an auxiliary add-on.
+The main focus is sustain-pedal detection as a core prediction target, instead of treating it as a small add-on to note transcription.
 
-## What makes this project unique
+## Project focus
 
 - It is a pedal-aware extension of piano transcription, with sustain-pedal events modeled alongside onsets and velocities.
 - The workflow is oriented toward evaluating and improving pedal prediction quality, not only note transcription.
@@ -18,9 +18,9 @@ This repository is intentionally differentiated by its focus on sustain-pedal de
 
 Credit and attribution:
 * The original onset/velocity model architecture and training workflow were inspired by the iamusica_training project by Andrés Fernández Rodríguez and collaborators.
-* The pedal-prediction extensions, repository structure, and current evaluation workflow in this project are original to this adaptation.
+* This adaptation adds the sustain-pedal output, related data handling, evaluation scripts, and the current project structure.
 
-This is [Free/Libre and Open Source Software](https://www.gnu.org/philosophy/floss-and-foss.en.html), see the [LICENSE](LICENSE) for more details. If you use this adapted work, please also credit the original paper: [Onsets and Velocities: Affordable Real-Time Piano Transcription Using Convolutional Neural Networks](https://arxiv.org/abs/2303.04485)
+This is [Free/Libre and Open Source Software](https://www.gnu.org/philosophy/floss-and-foss.en.html), see the [LICENSE](../LICENSE) for more details. If you use this adapted work, please also credit the original paper: [Onsets and Velocities: Affordable Real-Time Piano Transcription Using Convolutional Neural Networks](https://arxiv.org/abs/2303.04485)
 
 ```
 @inproceedings{onsvel,
@@ -89,7 +89,7 @@ Avoid ad-hoc `pip install --upgrade ...` commands inside `onsvel`; they can leav
 
 # Data downloading
 
-For this project, training and evaluation is done using the [MAESTRO](https://magenta.tensorflow.org/datasets/maestro) dataset. Specifically, we focus on the latest version, `MAESTROv3`. The full dataset can be readily downloaded at the provided link, and the file structure is expected to end up looking like this:
+For this project, training and evaluation use the [MAESTRO](https://magenta.tensorflow.org/datasets/maestro) dataset. The main experiments use `MAESTROv3`. After downloading the dataset, the file structure should look like this:
 
 ```
 MAESTROv3 ROOT PATH
@@ -113,9 +113,9 @@ Where each of the `20xx` directories contains `wav` files with their correspondi
 
 ### Downloading other supported datasets:
 
-To ensure compatibility with prior literature, this repository also provides functionality for `MAESTROv1` and `MAESTROv2` (the procedure for those is analogous to v3).
+For comparison with earlier work, the scripts also support `MAESTROv1` and `MAESTROv2` using the same general procedure.
 
-Furthermore, it also provides all functionality needed to use the [MAPS](https://hal.inria.fr/inria-00544155/document) dataset. To download it,
+The repository also includes scripts for the [MAPS](https://hal.inria.fr/inria-00544155/document) dataset. To download it,
 
 1. Request user and password here: https://adasp.telecom-paris.fr/resources/2010-07-08-maps-database/
 2. Download e.g. via: `wget -r --ask-password --user="<YOUR EMAIL>" ftp://ftps.tsi.telecom-paristech.fr/share/maps/`
@@ -148,25 +148,24 @@ MAPS ROOT PATH
 
 # Data preprocessing
 
-To train the model, we represent the audio as log-mel spectrograms and the annotations as piano rolls (see [paper](https://arxiv.org/abs/2303.04485) for details). To speed up training and avoid redundant computations, we preprocess the full datasets ahead of time into [HDF5](https://www.h5py.org/) files.
+For training, audio is represented as log-mel spectrograms and annotations are represented as piano rolls (see the [reference paper](https://arxiv.org/abs/2303.04485) for details). To avoid recomputing these features during training, the datasets are preprocessed into [HDF5](https://www.h5py.org/) files.
 
-Assuming `MAESTROv3` is in `datasets/maestro/maestro-v3.0.0`, preprocessing with the default parameters can be done by simply calling the following script:
+Assuming `MAESTROv3` is in `datasets/maestro/maestro-v3.0.0`, run the preprocessing script with the default parameters:
 
 ```
 python scripts/00_prepare_maestro_hdf5.py
 ```
 
-Which will generate the `logmels` and `roll` inside the provided `OUTPUT_DIR` (default: `datasets`). Processing MAESTRO with our default parameters takes about 30min on a mid-end 16-core CPU; the piano roll HDF5 file takes about 0.5GB of space, and the log-mel file about 22.5GB.
+This generates the `logmels` and `roll` files inside `OUTPUT_DIR` (default: `datasets`). Processing MAESTRO with the default parameters takes about 30 minutes on a mid-range 16-core CPU. The piano-roll HDF5 file uses about 0.5 GB and the log-mel file about 22.5 GB.
 
-> :warning: **onset/offset collision**:
-> Note that creating piano rolls from MIDI requires to time-quantize the events. If the time resolution is too low, it could happen that two events for the same note end up in the same "bin", and therefore ignored. Another possible explanation is that the MIDI file includes redundant/inconsistent messages, which are also ignored.
-> During the preprocessing of MAESTRO/MAPS we can expect quite a few of those to happen, most likely due to the latter reason. We can ignore them, since we don't use piano rolls for evaluation.
+> **Note on onset/offset collisions:**
+> Creating piano rolls from MIDI requires event time quantization. If the time resolution is too low, two events for the same note can land in the same bin and one may be ignored. Redundant or inconsistent MIDI messages can also cause this. Some collisions are expected in MAESTRO/MAPS preprocessing, but piano rolls are not used directly for final evaluation.
 
 
 
 ### Preprocessing other supported datasets:
 
-The script also allows to precompute former maestro versions:
+The script also supports earlier MAESTRO versions:
 
 ```
 python scripts/00_prepare_maestro_hdf5.py MAESTRO_VERSION=1 MAESTRO_INPATH=datasets/maestro/maestro-v1.0.0
@@ -202,7 +201,7 @@ Place a downloaded or locally trained checkpoint under `out/model_snapshots/` an
 python scripts/03_evaluate_pedal_model.py SNAPSHOT_INPATH=out/model_snapshots/YOUR_MODEL.torch
 ```
 
-Yielding the following results after a few minutes:
+Example note-evaluation output:
 
 
 ```
@@ -217,13 +216,13 @@ ONS+VEL (t=0.74, s=-0.01)  0.962538    0.928580  0.945033
 
 # Training the model
 
-For adequate training, a GPU with at least 8GB of memory is sufficient. The following command trains a model from scratch on `MAESTROv3`:
+For training from scratch, a GPU with at least 8 GB of memory is recommended. The following command trains on `MAESTROv3`:
 
 ```
 python scripts/02_train_pedal_model.py
 ```
 
-The following is an excerpt from the default configuration that led to the results reported in our paper:
+The following is an excerpt from the reference note-model configuration:
 
 ```
 "OUTPUT_DIR": "out",
@@ -252,12 +251,12 @@ The following is an excerpt from the default configuration that led to the resul
 "XV_TOLERANCE_VEL": 0.1
 ```
 
-The model is periodically cross-validated and saved under `OUTPUT_DIR`, for further usage and analysis. The script also produces a log in the form or one JSON object per line (see below for an automated way to inspect the log).
+The model is periodically cross-validated and saved under `OUTPUT_DIR` for later evaluation. The training script also writes one JSON object per line to its log file, which can be inspected with the helper script below.
 
 
 ### Log inspection
 
-Since the log is a collection of JSON objects, its processing can be easily streamlined. The following script is an example, plotting the cross-validation metrics and fetching the maximum (requires `matplotlib`):
+Since the log is a collection of JSON objects, it can be parsed after training. The following script plots cross-validation metrics and reports the maximum value (requires `matplotlib`):
 
 ```
 python scripts/05_analyze_training_logs.py PLOT_RANGE="[0.90, 0.97]" LOG_PATH=<...>
@@ -266,7 +265,7 @@ python scripts/05_analyze_training_logs.py PLOT_RANGE="[0.90, 0.97]" LOG_PATH=<.
 
 ### Debugging/inspection during training
 
-This repo also provides the possibility to pause the training script at arbitrary points, articulated through the [breakpoint.json](breakpoint.json) file, expected to be in the following JSON format:
+For manual inspection, the training script can be paused through the [breakpoint.json](../breakpoint.json) file, using this format:
 
 ```
 {"inconditional": false,
@@ -289,7 +288,7 @@ Note that the default is simply to ignore this file, and to stop the training, t
 
 # Plot examples
 
-The qualitative plot used in the [paper](https://arxiv.org/abs/2303.04485) can be reproduced with the following command:
+A qualitative prediction plot can be generated with the following command:
 
 
 ```
