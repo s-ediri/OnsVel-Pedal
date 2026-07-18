@@ -116,7 +116,7 @@ def write_midi_output(result: TranscriptionResult, transcriber: PianoTranscriber
     """Write decoded notes and sustain-pedal intervals to a simple MIDI file."""
     try:
         import mido
-    except ImportError as exc:  # pragma: no cover - dependency is declared in project metadata
+    except ImportError as exc:
         raise RuntimeError("MIDI output requires the 'mido' package to be installed") from exc
 
     output_path = Path(output_path)
